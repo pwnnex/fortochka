@@ -1,59 +1,61 @@
-# Форточка (fortochka)
+# Fortochka
 
-Лёгкий маршрутизатор обхода для OpenWrt — selective/full routing.
-DNS — нативно в системе (nft + dnsmasq + dnsproxy), движок = «тупой» outbound.
+Engine is **Xray** (XHTTP / Vision / REALITY post-quantum); all routing and DNS
+live in the system (nft + dnsmasq + dnsproxy) — the engine is just a dumb outbound.
 
-## Возможности
-- Режимы: **all** (весь трафик в туннель) / **domains** (только списки) / **off**.
-- Outbound тремя способами: **сырой JSON** · **ссылка** (vless/trojan/ss/vmess,
-  с XHTTP `extra` и REALITY post-quantum `pqv`) · **подписка** (base64/список,
-  выбор сервера по номеру/имени).
-- Списки доменов и CIDR — раздельно: ручные файлы + remote-URL (автообновление по cron).
-- Исключения «всегда напрямую» (устройство/IP мимо туннеля).
-- Чистый DNS для заблок-доменов: dnsproxy (DoH/DoT/UDP) + bootstrap + TTL —
-  чтобы провайдер не подменял IP.
-- Резка QUIC, исключение NTP, уровень логов, скачивание списков через VPN.
-- LuCI-панель: состояние, логи, **встроенный спидтест туннеля**, кнопки управления.
+## Features
+- Modes: **all** (route everything) / **domains** (lists only) / **off**.
+- Outbound three ways: **raw JSON** · **share link** (vless/trojan/ss/vmess, with
+  XHTTP `extra` and REALITY post-quantum `pqv`) · **subscription** (base64/list,
+  pick server by number or name, auto-update — first fetch direct, then via VPN).
+- Domain and CIDR lists kept separate: manual files + remote URLs (cron auto-update).
+- **Per-device routing** — force a device fully through the VPN or always direct (IP/MAC).
+- Exclusions (destinations always direct).
+- Clean DNS for blocked domains: dnsproxy (DoH/DoT/UDP) + bootstrap + TTL, so the
+  ISP can't spoof their IPs. Built-in presets (Cloudflare/Google/Yandex/Quad9/AdGuard).
+- **Watchdog** — probes the tunnel and auto-restarts Xray if it dies.
+- **Self-update** from GitHub (`fortochka upgrade` / Update button).
+- QUIC blocking, NTP bypass, log level, list download via VPN.
+- LuCI panel: live **exit IP + country**, **↑↓ speed**, built-in **speedtest**, logs.
 
-## Зависимости
-`xray-core` · `kmod-nft-tproxy` · `dnsmasq-full` · `luci-base` · `dnsproxy` ·
-`curl` · `coreutils-base64` (install.sh ставит сам).
-> ⚠️ нужно ~25 МБ в /overlay. На устройствах с малым flash сначала освободи место.
-
-## Установка
-Скопировать папку на роутер и запустить установщик:
+## Install
+One-liner (on the router):
 ```
-scp -r fortochka root@192.168.1.1:/tmp/
-ssh root@192.168.1.1
-cd /tmp/fortochka && sh install.sh
+sh -c "$(curl -sSL https://raw.githubusercontent.com/pwnnex/fortochka/main/install.sh)"
 ```
-Затем: **LuCI → Сервисы → Форточка** → задать сервер (Outbound) → «Применить».
-Или править `/etc/config/fortochka` и `fortochka apply`.
+Or from a clone:
+```
+git clone https://github.com/pwnnex/fortochka && cd fortochka && sh install.sh
+```
+Then: **LuCI → Services → Fortochka** → set your server (Outbound) → Save & Apply.
+
+The installer pulls deps: `xray-core kmod-nft-tproxy dnsmasq-full dnsproxy curl
+coreutils-base64 luci-base`. Needs ~25 MB free in /overlay.
 
 ## CLI
 ```
-fortochka apply | down | status | speedtest
-fortochka update-lists      # скачать списки по URL
-fortochka sub-update        # обновить подписку
+fortochka status | apply | down | speedtest
+fortochka update-lists      # fetch remote lists
+fortochka sub-update        # refresh subscription
+fortochka upgrade           # self-update from github
 fortochka logs
 ```
-Xray и dnsproxy супервизит procd (`/etc/init.d/fortochka`).
+Xray and dnsproxy are supervised by procd (`/etc/init.d/fortochka`).
 
-## Структура
+## How it works
 ```
-etc/config/fortochka                 UCI-конфиг (main / outbound / dns / lists)
-usr/bin/fortochka                    вся логика
-etc/init.d/fortochka                 procd-сервис (xray + dnsproxy)
-etc/fortochka/*.lst                  domains/subnets/url_*/exclude/sub
-usr/share/luci/menu.d/…              пункт меню LuCI
-usr/share/rpcd/acl.d/…               права
-www/luci-static/resources/view/…     панель
-```
-
-## Как устроено
-```
-dnsmasq: заблок-домены -> dnsproxy(DoH) [чистый IP] -> nftset vpn4/vpn6
-nft (prerouting, mangle): daddr @vpn4 -> TPROXY :1234 + fwmark, @direct -> мимо
+dnsmasq: blocked domains -> dnsproxy(DoH) [clean IP] -> nftset vpn4/vpn6
+nft (prerouting, mangle): daddr @vpn4 -> TPROXY :1234 + fwmark, @direct -> bypass
 ip rule fwmark -> table 100 -> lo  ->  Xray dokodemo :1234 -> outbound (mark 255)
 ```
-Анти-петля: исходящие пакеты Xray помечены `mark 255` и первым правилом nft уходят мимо.
+Anti-loop: Xray's own outbound packets are marked `255` and returned early by nft.
+
+## Layout
+```
+etc/config/fortochka                 uci config (main / outbound / dns / lists)
+usr/bin/fortochka                    all logic
+etc/init.d/fortochka                 procd service (xray + dnsproxy)
+etc/fortochka/*.lst                  domains / subnets / url_* / exclude / dev_*
+usr/share/luci, usr/share/rpcd       luci menu + acl
+www/luci-static/resources/view/…     panel
+```

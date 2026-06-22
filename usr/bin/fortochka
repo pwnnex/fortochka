@@ -19,6 +19,12 @@ REMOTE_DOMAINS="$LIST_DIR/remote_domains.lst"
 REMOTE_SUBNETS="$LIST_DIR/remote_subnets.lst"
 EXCLUDE_FILE="$LIST_DIR/exclude.lst"
 SUB_FILE="$LIST_DIR/sub.lst"
+DEV_PROXY_FILE="$LIST_DIR/dev_proxy.lst"
+DEV_DIRECT_FILE="$LIST_DIR/dev_direct.lst"
+HEALTH_FILE=/tmp/fortochka.health
+API_PORT=10085
+RAW_URL="https://raw.githubusercontent.com/pwnnex/fortochka/main"
+TARBALL_URL="https://github.com/pwnnex/fortochka/archive/refs/heads/main.tar.gz"
 
 uci_get() { uci -q get "$CFG.$1" 2>/dev/null; }
 
@@ -60,13 +66,16 @@ dns_args() {
 # автообновление по расписанию (cron): списки + подписка
 cron_sched() {
 	case "$1" in
-		hourly) echo "0 * * * *"   ;;
-		6h)     echo "0 */6 * * *"  ;;
-		12h)    echo "0 */12 * * *" ;;
-		daily)  echo "0 4 * * *"    ;;
-		2days)  echo "0 4 */2 * *"  ;;
-		weekly) echo "0 4 * * 1"    ;;
-		*)      echo ""             ;;
+		1min)   echo "* * * * *"     ;;
+		5min)   echo "*/5 * * * *"   ;;
+		10min)  echo "*/10 * * * *"  ;;
+		hourly) echo "0 * * * *"     ;;
+		6h)     echo "0 */6 * * *"   ;;
+		12h)    echo "0 */12 * * *"  ;;
+		daily)  echo "0 4 * * *"     ;;
+		2days)  echo "0 4 */2 * *"   ;;
+		weekly) echo "0 4 * * 1"     ;;
+		*)      echo ""              ;;
 	esac
 }
 
@@ -76,6 +85,7 @@ cron_apply() {
 	sed -i '\#/usr/bin/fortochka #d' "$CRON" 2>/dev/null   # убрать все строки fortochka
 	S=$(cron_sched "$(uci_get main.update_interval)"); [ -n "$S" ] && echo "$S /usr/bin/fortochka update-lists" >> "$CRON"
 	S=$(cron_sched "$(uci_get proxy.sub_interval)");   [ -n "$S" ] && echo "$S /usr/bin/fortochka sub-update"   >> "$CRON"
+	S=$(cron_sched "$(uci_get main.watchdog)");        [ -n "$S" ] && echo "$S /usr/bin/fortochka watchdog"     >> "$CRON"
 	/etc/init.d/cron enable >/dev/null 2>&1
 	/etc/init.d/cron restart >/dev/null 2>&1
 }
@@ -248,7 +258,9 @@ gen_xray() {
 	cat > "$XRAY_CFG" <<EOF
 {
   "log": { "loglevel": "$LOGLEVEL" },
-  "policy": { "levels": { "0": { "bufferSize": 128, "connIdle": 300 } }, "system": { "statsInboundUplink": false, "statsInboundDownlink": false } },
+  "stats": {},
+  "api": { "tag": "api", "services": [ "StatsService" ] },
+  "policy": { "levels": { "0": { "bufferSize": 128, "connIdle": 300 } }, "system": { "statsOutboundUplink": true, "statsOutboundDownlink": true } },
   "inbounds": [
     {
       "tag": "tproxy4", "listen": "127.0.0.1", "port": $PORT, "protocol": "dokodemo-door",
@@ -265,9 +277,14 @@ gen_xray() {
     {
       "tag": "socks-in", "listen": "127.0.0.1", "port": $SOCKS_PORT, "protocol": "socks",
       "settings": { "udp": true }
+    },
+    {
+      "tag": "api-in", "listen": "127.0.0.1", "port": $API_PORT, "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1" }
     }
   ],
-  "outbounds": [ $OUT ]
+  "outbounds": [ $OUT ],
+  "routing": { "rules": [ { "type": "field", "inboundTag": [ "api-in" ], "outboundTag": "api" } ] }
 }
 EOF
 }
@@ -341,6 +358,29 @@ load_nft() {
 		RULE6="meta l4proto { tcp, udp } ip6 daddr @vpn6 tproxy ip6 to [::1]:$PORT meta mark set $FWMARK accept"
 	fi
 
+	# правила по устройствам (источник: ip / ip6 / mac)
+	#   dev_direct.lst — устройство всегда напрямую; dev_proxy.lst — целиком в туннель
+	dev_block() {
+		[ -f "$1" ] || return 0
+		while IFS= read -r e; do
+			e=$(echo "$e" | tr -d ' \t\r'); case "$e" in ''|\#*) continue ;; esac
+			if echo "$e" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then sel="ether saddr $e"
+			elif echo "$e" | grep -q ':'; then sel="ip6 saddr $e"
+			else sel="ip saddr $e"; fi
+			if [ "$2" = direct ]; then
+				printf '\t\t%s return\n' "$sel"
+			else
+				case "$sel" in
+					ip6\ *)  printf '\t\t%s meta l4proto { tcp, udp } tproxy ip6 to [::1]:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" ;;
+					ip\ *)   printf '\t\t%s meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" ;;
+					ether*)  printf '\t\t%s meta nfproto ipv4 meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%s meta mark set %s accept\n\t\t%s meta nfproto ipv6 meta l4proto { tcp, udp } tproxy ip6 to [::1]:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" "$sel" "$PORT" "$FWMARK" ;;
+				esac
+			fi
+		done < "$1"
+	}
+	DEV_DIRECT=$(dev_block "$DEV_DIRECT_FILE" direct)
+	DEV_PROXY=$(dev_block "$DEV_PROXY_FILE" proxy)
+
 	# 1) таблица с пустыми сетами + правила (быстро, всегда успешно)
 	nft -f - <<EOF || return 1
 add table inet $NFT_TABLE
@@ -353,12 +393,14 @@ add table inet $NFT_TABLE {
 	chain prerouting {
 		type filter hook prerouting priority mangle; policy accept;
 		meta mark 0xff return
+$DEV_DIRECT
 		fib daddr type local return
 		ip daddr @direct4 return
 		ip6 daddr @direct6 return
 		ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
 		ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
 		$NTP
+$DEV_PROXY
 		$QUIC
 		$QUIC4
 		$QUIC6
@@ -510,6 +552,60 @@ status() {
 	echo "автообновление: $INTERVAL   |   скачивать через VPN: $VIAPROXY"
 	echo "DNS     : $DNS_TYPE${DNS_TYPE:+ ($DNS_MAIN)}   bootstrap: $DNS_BOOT"
 	pidof dnsproxy >/dev/null 2>&1 && echo "dnsproxy: running" || { [ "$DNS_TYPE" != off ] && echo "dnsproxy: STOPPED" ; }
+	WD=$(uci_get main.watchdog); WD=${WD:-off}
+	wdi=""; [ -f "$HEALTH_FILE" ] && wdi="  (last fail $(sed -n 's/^lastfail=//p' "$HEALTH_FILE" 2>/dev/null), restarts $(sed -n 's/^restarts=//p' "$HEALTH_FILE" 2>/dev/null))"
+	echo "watchdog: $WD$wdi"
+	pd=$(grep -vcE '^[[:space:]]*(#|$)' "$DEV_PROXY_FILE" 2>/dev/null); pdd=$(grep -vcE '^[[:space:]]*(#|$)' "$DEV_DIRECT_FILE" 2>/dev/null)
+	[ "${pd:-0}${pdd:-0}" != "00" ] && echo "devices : via-vpn ${pd:-0}, direct ${pdd:-0}"
+}
+
+# текущие байты вверх/вниз по outbound proxy (для живой статы в панели)
+stats() {
+	pidof xray >/dev/null 2>&1 || { echo "0 0"; return; }
+	J=$(xray api statsquery --server="127.0.0.1:$API_PORT" 2>/dev/null)
+	up=$(echo "$J" | jq -r '.stat[]? | select(.name=="outbound>>>proxy>>>traffic>>>uplink") | .value' 2>/dev/null)
+	dn=$(echo "$J" | jq -r '.stat[]? | select(.name=="outbound>>>proxy>>>traffic>>>downlink") | .value' 2>/dev/null)
+	echo "${up:-0} ${dn:-0}"
+}
+
+# exit IP + код страны (через туннель)
+exit_info() {
+	pidof xray >/dev/null 2>&1 || { echo "- --"; return; }
+	ip=$(curl -fsS --max-time 8 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://api.ipify.org 2>/dev/null)
+	[ -z "$ip" ] && { echo "- --"; return; }
+	cc=$(curl -fsS --max-time 6 "http://ip-api.com/line/$ip?fields=countryCode" 2>/dev/null)
+	echo "$ip ${cc:-??}"
+}
+
+# watchdog: жив ли туннель; если нет — рестарт и запись в health-файл
+watchdog() {
+	load_main
+	if curl -fsS --max-time 8 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://www.gstatic.com/generate_204 -o /dev/null 2>/dev/null; then
+		return 0
+	fi
+	n=$(sed -n 's/^restarts=//p' "$HEALTH_FILE" 2>/dev/null); n=$((${n:-0}+1))
+	printf 'lastfail=%s\nrestarts=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" > "$HEALTH_FILE"
+	/etc/init.d/fortochka restart
+}
+
+# self-update с github (только код, конфиг/списки не трогаем)
+upgrade() {
+	echo "качаю свежую версию с github…"
+	d=/tmp/fortochka-up; rm -rf "$d"; mkdir -p "$d"
+	curl -fsSL "$TARBALL_URL" | tar -xz -C "$d" --strip-components=1 2>/dev/null || { echo "не скачалось"; return 1; }
+	[ -f "$d/usr/bin/fortochka" ] || { echo "битый архив"; return 1; }
+	cp "$d/usr/bin/fortochka" /usr/bin/fortochka
+	cp "$d/etc/init.d/fortochka" /etc/init.d/fortochka
+	mkdir -p /usr/share/luci/menu.d /usr/share/rpcd/acl.d /www/luci-static/resources/view/fortochka
+	cp "$d"/usr/share/luci/menu.d/* /usr/share/luci/menu.d/ 2>/dev/null
+	cp "$d"/usr/share/rpcd/acl.d/* /usr/share/rpcd/acl.d/ 2>/dev/null
+	cp "$d"/www/luci-static/resources/view/fortochka/* /www/luci-static/resources/view/fortochka/ 2>/dev/null
+	sed -i 's/\r$//' /usr/bin/fortochka /etc/init.d/fortochka
+	chmod +x /usr/bin/fortochka /etc/init.d/fortochka
+	rm -f /tmp/luci-indexcache*; rm -rf /tmp/luci-modulecache
+	/etc/init.d/rpcd restart >/dev/null 2>&1
+	/etc/init.d/fortochka restart >/dev/null 2>&1
+	echo "обновлено. жми Ctrl+F5 в панели."
 }
 
 # встроенный тест скорости туннеля (своя фишка)
@@ -532,7 +628,11 @@ case "$1" in
 	cron)                load_main; cron_apply; echo "cron: $INTERVAL" ;;
 	logs)                show_logs ;;
 	speedtest)           speedtest ;;
+	stats)               stats ;;
+	exit-info)           exit_info ;;
+	watchdog)            watchdog ;;
+	upgrade)             upgrade ;;
 	dns-args)            dns_args ;;
 	status)              status ;;
-	*) echo "usage: fortochka {apply|down|gen|nft|update-lists|sub-update|cron|logs|speedtest|status}" ;;
+	*) echo "usage: fortochka {apply|down|status|update-lists|sub-update|speedtest|stats|exit-info|watchdog|upgrade|logs}" ;;
 esac

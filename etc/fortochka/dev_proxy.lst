@@ -1,0 +1,4 @@
+# devices whose whole traffic goes through the tunnel (even in domains mode)
+# one IP or MAC per line. example:
+# 192.168.1.50
+# aa:bb:cc:dd:ee:ff

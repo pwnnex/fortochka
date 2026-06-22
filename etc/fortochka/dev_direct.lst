@@ -1,0 +1,4 @@
+# devices that always go direct, never through the tunnel
+# one IP or MAC per line. example:
+# 192.168.1.70
+# aa:bb:cc:dd:ee:ff

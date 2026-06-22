@@ -1,17 +1,21 @@
 {
 	"luci-app-fortochka": {
-		"description": "Управление Форточкой (selective proxy)",
+		"description": "fortochka proxy router",
 		"read": {
 			"uci": [ "fortochka" ],
 			"file": {
 				"/usr/bin/fortochka status": [ "exec" ],
 				"/usr/bin/fortochka logs": [ "exec" ],
 				"/usr/bin/fortochka speedtest": [ "exec" ],
+				"/usr/bin/fortochka stats": [ "exec" ],
+				"/usr/bin/fortochka exit-info": [ "exec" ],
 				"/etc/fortochka/domains.lst": [ "read" ],
 				"/etc/fortochka/subnets.lst": [ "read" ],
 				"/etc/fortochka/url_domains.lst": [ "read" ],
 				"/etc/fortochka/url_subnets.lst": [ "read" ],
-				"/etc/fortochka/exclude.lst": [ "read" ]
+				"/etc/fortochka/exclude.lst": [ "read" ],
+				"/etc/fortochka/dev_proxy.lst": [ "read" ],
+				"/etc/fortochka/dev_direct.lst": [ "read" ]
 			}
 		},
 		"write": {
@@ -21,11 +25,14 @@
 				"/etc/init.d/fortochka stop": [ "exec" ],
 				"/usr/bin/fortochka update-lists": [ "exec" ],
 				"/usr/bin/fortochka sub-update": [ "exec" ],
+				"/usr/bin/fortochka upgrade": [ "exec" ],
 				"/etc/fortochka/domains.lst": [ "write" ],
 				"/etc/fortochka/subnets.lst": [ "write" ],
 				"/etc/fortochka/url_domains.lst": [ "write" ],
 				"/etc/fortochka/url_subnets.lst": [ "write" ],
-				"/etc/fortochka/exclude.lst": [ "write" ]
+				"/etc/fortochka/exclude.lst": [ "write" ],
+				"/etc/fortochka/dev_proxy.lst": [ "write" ],
+				"/etc/fortochka/dev_direct.lst": [ "write" ]
 			}
 		}
 	}

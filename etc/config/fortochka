@@ -12,6 +12,7 @@ config fortochka 'main'
 	option update_interval 'off'
 	option log_level 'warning'
 	option download_via_proxy '0'
+	option watchdog 'off'
 	list lan_iface 'br-lan'
 
 # outbound: сырой json / ссылка (proxy_url) / подписка (sub_url)

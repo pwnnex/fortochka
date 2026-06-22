@@ -1,6 +1,6 @@
 {
 	"admin/services/fortochka": {
-		"title": "Форточка",
+		"title": "Fortochka",
 		"order": 60,
 		"action": {
 			"type": "view",
