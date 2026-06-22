@@ -59,3 +59,6 @@ etc/fortochka/*.lst                  domains / subnets / url_* / exclude / dev_*
 usr/share/luci, usr/share/rpcd       luci menu + acl
 www/luci-static/resources/view/…     panel
 ```
+
+## License
+GPL-3.0 — see [LICENSE](LICENSE).

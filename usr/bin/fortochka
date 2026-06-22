@@ -95,11 +95,11 @@ show_logs() {
 	echo "=== xray ==="
 	logread -e xray 2>/dev/null | tail -40
 	echo
-	echo "=== dnsmasq (ошибки) ==="
+	echo "=== dnsmasq (errors) ==="
 	logread -e dnsmasq 2>/dev/null | grep -iE 'error|fail|warn|nftset|bad' | tail -15
 	echo
-	echo "=== fortochka конфиг dnsmasq ==="
-	echo "nftset-строк: $(grep -c '^nftset=' "$DNSMASQ_CONF" 2>/dev/null)"
+	echo "=== fortochka dnsmasq conf ==="
+	echo "nftset lines: $(grep -c '^nftset=' "$DNSMASQ_CONF" 2>/dev/null)"
 }
 
 # парсер share-ссылок (vless/trojan/ss/vmess) -> outbound JSON
@@ -195,14 +195,14 @@ _sub_fetch() {
 	else
 		RAW=$(fetch_via direct "$U")
 	fi
-	[ -z "$RAW" ] && { echo "fortochka: подписка не скачалась" >&2; return 1; }
+	[ -z "$RAW" ] && { echo "fortochka: subscription download failed" >&2; return 1; }
 	# plain-список или base64
 	LINKS=$(printf '%s\n' "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
 	[ -z "$LINKS" ] && LINKS=$(b64blob "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
 	mkdir -p "$LIST_DIR"
 	printf '%s\n' "$LINKS" | grep . > "$SUB_FILE"
 	N=$(grep -c . "$SUB_FILE" 2>/dev/null)
-	echo "fortochka: подписка — $N серверов" >&2
+	echo "fortochka: subscription: $N servers" >&2
 	[ "${N:-0}" -gt 0 ]
 }
 
@@ -220,7 +220,7 @@ sub_pick() {
 }
 
 sub_update() {
-	_sub_fetch || { echo "fortochka: подписка пуста/не скачалась"; return 1; }
+	_sub_fetch || { echo "fortochka: subscription empty / not fetched"; return 1; }
 	apply
 }
 
@@ -232,7 +232,7 @@ gen_outbound() {
 			u=$(uci_get proxy.proxy_url); [ -z "$u" ] && return 1
 			link_to_outbound "$u" ;;
 		subscription)
-			L=$(sub_pick); [ -z "$L" ] && { echo "fortochka: подписка пуста — обнови её" >&2; return 1; }
+			L=$(sub_pick); [ -z "$L" ] && { echo "fortochka: subscription empty — update it" >&2; return 1; }
 			link_to_outbound "$L" ;;
 		*)
 			uci_get proxy.outbound_json ;;
@@ -242,9 +242,9 @@ gen_outbound() {
 # генерация конфига Xray
 gen_xray() {
 	load_main
-	command -v jq >/dev/null 2>&1 || { echo "fortochka: нужен jq (apk add jq)"; return 1; }
+	command -v jq >/dev/null 2>&1 || { echo "fortochka: jq required (apk add jq)"; return 1; }
 	OUT=$(gen_outbound)
-	[ -z "$OUT" ] && { echo "fortochka: outbound не задан (config_type/outbound_json/proxy_url)"; return 1; }
+	[ -z "$OUT" ] && { echo "fortochka: no outbound set (config_type/outbound_json/proxy_url)"; return 1; }
 	# принудительно tag=proxy и sockopt.mark=255 (анти-петля TPROXY)
 	OUT=$(printf '%s' "$OUT" | jq -c '
 		.tag = "proxy"
@@ -252,7 +252,7 @@ gen_xray() {
 		| .streamSettings.sockopt = (.streamSettings.sockopt // {})
 		| .streamSettings.sockopt.mark = 255
 	' 2>/dev/null)
-	[ -z "$OUT" ] && { echo "fortochka: outbound_json — невалидный JSON"; return 1; }
+	[ -z "$OUT" ] && { echo "fortochka: invalid outbound JSON"; return 1; }
 
 	mkdir -p "$(dirname "$XRAY_CFG")"
 	cat > "$XRAY_CFG" <<EOF
@@ -474,7 +474,7 @@ _apply() {
 apply() {
 	if command -v flock >/dev/null 2>&1; then
 		exec 9>"$LOCK" 2>/dev/null
-		flock -n 9 2>/dev/null || { echo "fortochka: apply уже выполняется — пропуск"; return 0; }
+		flock -n 9 2>/dev/null || { echo "fortochka: apply already running — skip"; return 0; }
 		_apply; rc=$?; exec 9>&- 2>/dev/null; return $rc
 	fi
 	_apply
@@ -526,7 +526,7 @@ update_lists() {
 			| grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]+:[0-9a-fA-F:]*(/[0-9]{1,3})?$' \
 			| sort -u > "$REMOTE_SUBNETS"
 	fi
-	echo "fortochka: домены $(wc -l < "$REMOTE_DOMAINS" 2>/dev/null), подсети $(wc -l < "$REMOTE_SUBNETS" 2>/dev/null)"
+	echo "fortochka: domains $(wc -l < "$REMOTE_DOMAINS" 2>/dev/null), subnets $(wc -l < "$REMOTE_SUBNETS" 2>/dev/null)"
 	# если outbound берётся из подписки — обновим и её
 	[ "$(uci_get proxy.config_type)" = "subscription" ] && _sub_fetch
 	# перечитать списки в nft/dnsmasq без перезапуска xray (конфиг xray не менялся)
@@ -539,7 +539,7 @@ status() {
 	CT=$(uci_get proxy.config_type); CT=${CT:-outbound}
 	if [ "$CT" = "subscription" ]; then
 		SI=$(uci_get proxy.sub_interval); SI=${SI:-off}
-		echo "outbound: подписка ($(grep -c . "$SUB_FILE" 2>/dev/null) серв., автообн: $SI)"
+		echo "outbound: subscription ($(grep -c . "$SUB_FILE" 2>/dev/null) servers, auto-update: $SI)"
 	else
 		echo "outbound: $CT"
 	fi
@@ -549,7 +549,7 @@ status() {
 	sc=$(collect_subnets 2>/dev/null | grep -c .)
 	echo "domains : $dc | subnets: $sc"
 	ip rule show 2>/dev/null | grep -q "fwmark" && echo "ip rule : ok" || echo "ip rule : MISSING"
-	echo "автообновление: $INTERVAL   |   скачивать через VPN: $VIAPROXY"
+	echo "lists auto-update: $INTERVAL   |   download via VPN: $VIAPROXY"
 	echo "DNS     : $DNS_TYPE${DNS_TYPE:+ ($DNS_MAIN)}   bootstrap: $DNS_BOOT"
 	pidof dnsproxy >/dev/null 2>&1 && echo "dnsproxy: running" || { [ "$DNS_TYPE" != off ] && echo "dnsproxy: STOPPED" ; }
 	WD=$(uci_get main.watchdog); WD=${WD:-off}
@@ -590,12 +590,12 @@ watchdog() {
 
 # self-update с github (только код, конфиг/списки не трогаем)
 upgrade() {
-	echo "качаю свежую версию с github…"
-	curl -fsSL "$TARBALL_URL" -o /tmp/ft.tgz || { echo "не скачалось"; return 1; }
+	echo "fetching latest from github…"
+	curl -fsSL "$TARBALL_URL" -o /tmp/ft.tgz || { echo "download failed"; return 1; }
 	rm -rf /tmp/ft-up; mkdir -p /tmp/ft-up
-	tar -xzf /tmp/ft.tgz -C /tmp/ft-up 2>/dev/null || { echo "битый архив"; return 1; }
+	tar -xzf /tmp/ft.tgz -C /tmp/ft-up 2>/dev/null || { echo "bad archive"; return 1; }
 	d=$(ls -d /tmp/ft-up/*/ 2>/dev/null | head -1)
-	[ -n "$d" ] && [ -f "${d}usr/bin/fortochka" ] || { echo "битый архив"; return 1; }
+	[ -n "$d" ] && [ -f "${d}usr/bin/fortochka" ] || { echo "bad archive"; return 1; }
 	cp "${d}usr/bin/fortochka" /usr/bin/fortochka
 	cp "${d}etc/init.d/fortochka" /etc/init.d/fortochka
 	mkdir -p /usr/share/luci/menu.d /usr/share/rpcd/acl.d /www/luci-static/resources/view/fortochka
@@ -607,17 +607,17 @@ upgrade() {
 	rm -f /tmp/luci-indexcache*; rm -rf /tmp/luci-modulecache
 	/etc/init.d/rpcd restart >/dev/null 2>&1
 	/etc/init.d/fortochka restart >/dev/null 2>&1
-	echo "обновлено. жми Ctrl+F5 в панели."
+	echo "updated. hit Ctrl+F5 in the panel."
 }
 
 # встроенный тест скорости туннеля (своя фишка)
 speedtest() {
-	pidof xray >/dev/null 2>&1 || { echo "xray не запущен"; return 1; }
-	echo "Тест через туннель (socks 127.0.0.1:$SOCKS_PORT), 50 МБ…"
+	pidof xray >/dev/null 2>&1 || { echo "xray not running"; return 1; }
+	echo "testing via tunnel (socks 127.0.0.1:$SOCKS_PORT), 50 MB…"
 	S=$(curl -o /dev/null -s -w '%{speed_download}' --max-time 25 --socks5-hostname "127.0.0.1:$SOCKS_PORT" 'https://speed.cloudflare.com/__down?bytes=50000000')
-	[ -z "$S" ] || [ "$S" = "0" ] && { echo "не удалось — туннель не отвечает"; return 1; }
-	awk -v s="$S" 'BEGIN{ printf "1 поток: %.1f Мбит/с  (%.2f МБ/с)\n", s*8/1000000, s/1048576 }'
-	echo "(для справки: 1080p≈8, 1440p≈16, 4K≈25-45 Мбит/с)"
+	[ -z "$S" ] || [ "$S" = "0" ] && { echo "failed — tunnel not responding"; return 1; }
+	awk -v s="$S" 'BEGIN{ printf "1 stream: %.1f Mbit/s  (%.2f MB/s)\n", s*8/1000000, s/1048576 }'
+	echo "(ref: 1080p~8, 1440p~16, 4K~25-45 Mbit/s)"
 }
 
 case "$1" in
