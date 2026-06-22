@@ -1,0 +1,32 @@
+{
+	"luci-app-fortochka": {
+		"description": "Управление Форточкой (selective proxy)",
+		"read": {
+			"uci": [ "fortochka" ],
+			"file": {
+				"/usr/bin/fortochka status": [ "exec" ],
+				"/usr/bin/fortochka logs": [ "exec" ],
+				"/usr/bin/fortochka speedtest": [ "exec" ],
+				"/etc/fortochka/domains.lst": [ "read" ],
+				"/etc/fortochka/subnets.lst": [ "read" ],
+				"/etc/fortochka/url_domains.lst": [ "read" ],
+				"/etc/fortochka/url_subnets.lst": [ "read" ],
+				"/etc/fortochka/exclude.lst": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "fortochka" ],
+			"file": {
+				"/etc/init.d/fortochka restart": [ "exec" ],
+				"/etc/init.d/fortochka stop": [ "exec" ],
+				"/usr/bin/fortochka update-lists": [ "exec" ],
+				"/usr/bin/fortochka sub-update": [ "exec" ],
+				"/etc/fortochka/domains.lst": [ "write" ],
+				"/etc/fortochka/subnets.lst": [ "write" ],
+				"/etc/fortochka/url_domains.lst": [ "write" ],
+				"/etc/fortochka/url_subnets.lst": [ "write" ],
+				"/etc/fortochka/exclude.lst": [ "write" ]
+			}
+		}
+	}
+}

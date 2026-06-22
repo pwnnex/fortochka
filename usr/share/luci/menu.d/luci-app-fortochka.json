@@ -1,0 +1,13 @@
+{
+	"admin/services/fortochka": {
+		"title": "Форточка",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "fortochka/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-fortochka" ]
+		}
+	}
+}

@@ -1,0 +1,35 @@
+# fortochka — обходной роутер на xray + nftables + dnsmasq
+# режимы: all (весь трафик в туннель) | domains (только списки) | off
+
+config fortochka 'main'
+	option enabled '1'
+	option mode 'domains'
+	option tproxy_port '1234'
+	option fwmark '1'
+	option route_table '100'
+	option disable_quic '1'
+	option exclude_ntp '0'
+	option update_interval 'off'
+	option log_level 'warning'
+	option download_via_proxy '0'
+	list lan_iface 'br-lan'
+
+# outbound: сырой json / ссылка (proxy_url) / подписка (sub_url)
+# tag и sockopt.mark=255 проставляются сами. ниже — пример, впиши свой сервер
+config outbound 'proxy'
+	option config_type 'outbound'
+	option proxy_url ''
+	option sub_url ''
+	option sub_select ''
+	option sub_interval 'off'
+	option outbound_json '{"protocol":"vless","settings":{"vnext":[{"address":"YOUR_SERVER","port":443,"users":[{"id":"YOUR_UUID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"YOUR_PUBLIC_KEY","shortId":"","fingerprint":"chrome"}}}'
+
+# списки и url-источники лежат в /etc/fortochka/*.lst (правятся в панели)
+# dns: заблок-домены резолвятся через dnsproxy (doh/dot), чтоб провайдер не подменял ip
+config dns 'dns'
+	option dns_type 'doh'
+	option dns_server 'https://1.1.1.1/dns-query'
+	option bootstrap '77.88.8.8'
+	option rewrite_ttl '60'
+
+config lists 'lists'

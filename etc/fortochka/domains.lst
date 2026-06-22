@@ -1,0 +1,10 @@
+# fortochka — список доменов для режима domains (один домен в строке).
+# Поддомены матчатся автоматически (youtube.com покрывает *.youtube.com).
+# Строки с # и пустые игнорируются.
+
+youtube.com
+googlevideo.com
+ytimg.com
+ggpht.com
+instagram.com
+cdninstagram.com

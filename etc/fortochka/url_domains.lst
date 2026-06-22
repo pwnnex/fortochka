@@ -1,0 +1,6 @@
+# URL списков ДОМЕНОВ (по одному в строке). Скачиваются по «Обновить списки».
+# re:filter — обновляется ежедневно (GitHub Actions).
+https://raw.githubusercontent.com/1andrevich/Re-filter-lists/main/domains_all.lst
+https://raw.githubusercontent.com/1andrevich/Re-filter-lists/main/community.lst
+# itdog geoblock — сервисы, блокирующие РФ снаружи: Claude, OpenAI, TikTok, Supercell, Spotify, Notion…
+https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst

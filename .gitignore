@@ -1,0 +1,4 @@
+# генерируется на роутере, в репу не нужно
+etc/fortochka/remote_*.lst
+etc/fortochka/sub.lst
+*.tar.gz

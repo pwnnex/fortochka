@@ -1,0 +1,538 @@
+#!/bin/sh
+# fortochka — лёгкий обходной роутер для openwrt
+# xray (dokodemo tproxy) + nftables (fwmark) + dnsmasq (nftset)
+# списки в /etc/fortochka/*.lst, outbound в uci
+
+CFG=fortochka
+XRAY_BIN=/usr/bin/xray
+XRAY_CFG=/etc/xray/config.json
+NFT_TABLE=fortochka
+DNSMASQ_DIR=/tmp/dnsmasq.d
+DNSMASQ_CONF="$DNSMASQ_DIR/fortochka.conf"
+
+LIST_DIR=/etc/fortochka
+DOMAINS_FILE="$LIST_DIR/domains.lst"
+SUBNETS_FILE="$LIST_DIR/subnets.lst"
+URL_DOMAINS="$LIST_DIR/url_domains.lst"
+URL_SUBNETS="$LIST_DIR/url_subnets.lst"
+REMOTE_DOMAINS="$LIST_DIR/remote_domains.lst"
+REMOTE_SUBNETS="$LIST_DIR/remote_subnets.lst"
+EXCLUDE_FILE="$LIST_DIR/exclude.lst"
+SUB_FILE="$LIST_DIR/sub.lst"
+
+uci_get() { uci -q get "$CFG.$1" 2>/dev/null; }
+
+load_main() {
+	ENABLED=$(uci_get main.enabled);     ENABLED=${ENABLED:-0}
+	MODE=$(uci_get main.mode);           MODE=${MODE:-domains}
+	PORT=$(uci_get main.tproxy_port);    PORT=${PORT:-1234}
+	FWMARK=$(uci_get main.fwmark);       FWMARK=${FWMARK:-1}
+	TABLE=$(uci_get main.route_table);   TABLE=${TABLE:-100}
+	NOQUIC=$(uci_get main.disable_quic); NOQUIC=${NOQUIC:-1}
+	INTERVAL=$(uci_get main.update_interval); INTERVAL=${INTERVAL:-off}
+	LOGLEVEL=$(uci_get main.log_level); LOGLEVEL=${LOGLEVEL:-warning}
+	VIAPROXY=$(uci_get main.download_via_proxy); VIAPROXY=${VIAPROXY:-0}
+	DNS_TYPE=$(uci_get dns.dns_type); DNS_TYPE=${DNS_TYPE:-off}
+	DNS_MAIN=$(uci_get dns.dns_server); DNS_MAIN=${DNS_MAIN:-https://1.1.1.1/dns-query}
+	DNS_BOOT=$(uci_get dns.bootstrap); DNS_BOOT=${DNS_BOOT:-77.88.8.8}
+	DNS_TTL=$(uci_get dns.rewrite_ttl); DNS_TTL=${DNS_TTL:-60}
+	EXCLUDE_NTP=$(uci_get main.exclude_ntp); EXCLUDE_NTP=${EXCLUDE_NTP:-0}
+}
+
+LOCK=/var/lock/fortochka.lock
+SOCKS_PORT=1081
+DNS_PORT=5353
+
+# аргументы запуска dnsproxy (чистый резолвер для заблокированных доменов)
+dns_args() {
+	load_main
+	[ "$DNS_TYPE" = "off" ] && return 1
+	case "$DNS_TYPE" in
+		doh) UP="$DNS_MAIN"; case "$UP" in https://*) :;; *) UP="https://$UP/dns-query";; esac ;;
+		dot) UP="$DNS_MAIN"; case "$UP" in tls://*) :;; *) UP="tls://$UP";; esac ;;
+		udp) UP="$DNS_MAIN" ;;
+		*) return 1 ;;
+	esac
+	B="$DNS_BOOT"; case "$B" in *:*) :;; *) B="$B:53";; esac
+	echo "-l 127.0.0.1 -p $DNS_PORT -u $UP -b $B --cache --cache-max-ttl=${DNS_TTL:-60}"
+}
+
+# автообновление по расписанию (cron): списки + подписка
+cron_sched() {
+	case "$1" in
+		hourly) echo "0 * * * *"   ;;
+		6h)     echo "0 */6 * * *"  ;;
+		12h)    echo "0 */12 * * *" ;;
+		daily)  echo "0 4 * * *"    ;;
+		2days)  echo "0 4 */2 * *"  ;;
+		weekly) echo "0 4 * * 1"    ;;
+		*)      echo ""             ;;
+	esac
+}
+
+cron_apply() {
+	CRON=/etc/crontabs/root
+	touch "$CRON"
+	sed -i '\#/usr/bin/fortochka #d' "$CRON" 2>/dev/null   # убрать все строки fortochka
+	S=$(cron_sched "$(uci_get main.update_interval)"); [ -n "$S" ] && echo "$S /usr/bin/fortochka update-lists" >> "$CRON"
+	S=$(cron_sched "$(uci_get proxy.sub_interval)");   [ -n "$S" ] && echo "$S /usr/bin/fortochka sub-update"   >> "$CRON"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+
+# логи
+show_logs() {
+	echo "=== xray ==="
+	logread -e xray 2>/dev/null | tail -40
+	echo
+	echo "=== dnsmasq (ошибки) ==="
+	logread -e dnsmasq 2>/dev/null | grep -iE 'error|fail|warn|nftset|bad' | tail -15
+	echo
+	echo "=== fortochka конфиг dnsmasq ==="
+	echo "nftset-строк: $(grep -c '^nftset=' "$DNSMASQ_CONF" 2>/dev/null)"
+}
+
+# парсер share-ссылок (vless/trojan/ss/vmess) -> outbound JSON
+urldec() { printf '%b' "$(printf '%s' "$*" | sed 's/+/ /g; s/%\(..\)/\\x\1/g')"; }
+qget()   { echo "$QUERY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+b64dec() {
+	printf '%s' "$1" | tr '_-' '/+' | tr -dc 'A-Za-z0-9+/=' \
+		| awk '{ l=length($0)%4; if(l>0) $0=$0 substr("===",1,4-l); print }' | base64 -d 2>/dev/null
+}
+
+link_to_outbound() {
+	url="$1"; scheme=${url%%://*}; body=${url#*://}
+	case "$body" in *#*) body=${body%%#*};; esac
+
+	case "$scheme" in
+	vless|trojan)
+		userinfo=${body%%@*}; rest=${body#*@}
+		hostport=${rest%%\?*}; QUERY=""; case "$rest" in *\?*) QUERY=${rest#*\?};; esac
+		host=${hostport%%:*}; port=${hostport##*:}
+		net=$(qget type);     [ -z "$net" ] && net=tcp; [ "$net" = h2 ] && net=http
+		sec=$(qget security); [ -z "$sec" ] && sec=none
+		sni=$(urldec "$(qget sni)"); [ -z "$sni" ] && sni=$(urldec "$(qget peer)")
+		pbk=$(qget pbk); sid=$(qget sid); fp=$(qget fp); spx=$(urldec "$(qget spx)")
+		flow=$(qget flow); path=$(urldec "$(qget path)"); hh=$(urldec "$(qget host)")
+		svc=$(urldec "$(qget serviceName)"); mode=$(qget mode); alpn=$(urldec "$(qget alpn)")
+		pqv=$(qget pqv); extra=$(urldec "$(qget extra)")
+
+		stream=$(jq -nc \
+			--arg net "$net" --arg sec "$sec" --arg sni "$sni" --arg pbk "$pbk" \
+			--arg sid "$sid" --arg fp "$fp" --arg spx "$spx" --arg path "$path" \
+			--arg host "$hh" --arg svc "$svc" --arg mode "$mode" --arg alpn "$alpn" \
+			--arg pqv "$pqv" --arg extra "$extra" '
+			{ network: $net, security: (if $sec=="" then "none" else $sec end) }
+			+ (if $sec=="reality" then {realitySettings: ({serverName:$sni, publicKey:$pbk, shortId:$sid, fingerprint:(if $fp=="" then "chrome" else $fp end)} + (if $spx=="" then {} else {spiderX:$spx} end) + (if $pqv=="" then {} else {mldsa65Verify:$pqv} end))} else {} end)
+			+ (if $sec=="tls" then {tlsSettings: ({serverName:$sni, fingerprint:(if $fp=="" then "chrome" else $fp end)} + (if $alpn=="" then {} else {alpn: ($alpn|split(","))} end))} else {} end)
+			+ (if $net=="ws" then {wsSettings:{path:(if $path=="" then "/" else $path end), headers:(if $host=="" then {} else {Host:$host} end)}} else {} end)
+			+ (if $net=="httpupgrade" then {httpupgradeSettings:{path:(if $path=="" then "/" else $path end), host:$host}} else {} end)
+			+ (if $net=="grpc" then {grpcSettings:{serviceName:$svc}} else {} end)
+			+ (if $net=="xhttp" then {xhttpSettings:({path:(if $path=="" then "/" else $path end), mode:(if $mode=="" then "auto" else $mode end)} + (if $host=="" then {} else {host:$host} end) + (if $extra=="" then {} else (try {extra:($extra|fromjson)} catch {}) end))} else {} end)
+		')
+
+		if [ "$scheme" = vless ]; then
+			jq -nc --arg h "$host" --argjson p "${port:-443}" --arg id "$userinfo" --arg flow "$flow" --argjson ss "$stream" \
+			  '{protocol:"vless",settings:{vnext:[{address:$h,port:$p,users:[({id:$id,encryption:"none"} + (if $flow=="" then {} else {flow:$flow} end))]}]},streamSettings:$ss}'
+		else
+			jq -nc --arg h "$host" --argjson p "${port:-443}" --arg pw "$(urldec "$userinfo")" --argjson ss "$stream" \
+			  '{protocol:"trojan",settings:{servers:[{address:$h,port:$p,password:$pw}]},streamSettings:$ss}'
+		fi
+		;;
+	ss)
+		if echo "$body" | grep -q '@'; then
+			ui=${body%%@*}; hp=${body#*@}; hp=${hp%%\?*}; hp=${hp%%/*}
+			creds=$(b64dec "$ui"); [ -z "$creds" ] && creds=$(urldec "$ui")
+		else
+			dec=$(b64dec "$body"); creds=${dec%@*}; hp=${dec#*@}
+		fi
+		method=${creds%%:*}; pass=${creds#*:}; host=${hp%%:*}; port=${hp##*:}
+		jq -nc --arg h "$host" --argjson p "${port:-443}" --arg m "$method" --arg pw "$pass" \
+		  '{protocol:"shadowsocks",settings:{servers:[{address:$h,port:$p,method:$m,password:$pw}]}}'
+		;;
+	vmess)
+		b64dec "$body" | jq -c '
+		  {protocol:"vmess",
+		   settings:{vnext:[{address:.add, port:(.port|tonumber), users:[{id:.id, alterId:((.aid // 0)|tonumber), security:(.scy // "auto")}]}]},
+		   streamSettings: ({network:(.net // "tcp"), security:(if (.tls // "")=="tls" then "tls" else "none" end)}
+		     + (if (.tls//"")=="tls" then {tlsSettings:{serverName:(.sni // .host // "")}} else {} end)
+		     + (if (.net//"")=="ws" then {wsSettings:{path:(.path // "/"), headers:(if (.host//"")=="" then {} else {Host:.host} end)}} else {} end)
+		     + (if (.net//"")=="grpc" then {grpcSettings:{serviceName:(.path // "")}} else {} end)) }'
+		;;
+	*) return 1 ;;
+	esac
+}
+
+# подписка (sub): URL -> список ссылок
+b64blob() { b64dec "$1"; }
+
+# качалка с явным режимом: direct (напрямую) или proxy (через туннель)
+fetch_via() {
+	case "$1" in
+		proxy) curl -fsL --max-time 90 --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$2" 2>/dev/null ;;
+		*)     curl -fsL --max-time 90 "$2" 2>/dev/null || uclient-fetch -qO - "$2" 2>/dev/null || wget -qO - "$2" 2>/dev/null ;;
+	esac
+}
+
+# скачать подписку и сохранить ссылки в файл (без apply).
+# первый раз — напрямую (туннеля ещё может не быть). дальше через vpn, с откатом.
+_sub_fetch() {
+	load_main
+	U=$(uci_get proxy.sub_url)
+	[ -z "$U" ] && return 1
+	if [ -s "$SUB_FILE" ] && pidof xray >/dev/null 2>&1; then
+		RAW=$(fetch_via proxy "$U"); [ -z "$RAW" ] && RAW=$(fetch_via direct "$U")
+	else
+		RAW=$(fetch_via direct "$U")
+	fi
+	[ -z "$RAW" ] && { echo "fortochka: подписка не скачалась" >&2; return 1; }
+	# plain-список или base64
+	LINKS=$(printf '%s\n' "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
+	[ -z "$LINKS" ] && LINKS=$(b64blob "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
+	mkdir -p "$LIST_DIR"
+	printf '%s\n' "$LINKS" | grep . > "$SUB_FILE"
+	N=$(grep -c . "$SUB_FILE" 2>/dev/null)
+	echo "fortochka: подписка — $N серверов" >&2
+	[ "${N:-0}" -gt 0 ]
+}
+
+# выбрать ссылку из подписки (по номеру, имени или первую)
+sub_pick() {
+	[ -s "$SUB_FILE" ] || return 1
+	SEL=$(uci_get proxy.sub_select)
+	if [ -z "$SEL" ]; then
+		head -n1 "$SUB_FILE"
+	elif echo "$SEL" | grep -qE '^[0-9]+$'; then
+		sed -n "${SEL}p" "$SUB_FILE"
+	else
+		grep -m1 -iF "$SEL" "$SUB_FILE" || head -n1 "$SUB_FILE"
+	fi
+}
+
+sub_update() {
+	_sub_fetch || { echo "fortochka: подписка пуста/не скачалась"; return 1; }
+	apply
+}
+
+# выбор источника outbound: сырой JSON / ссылка / подписка
+gen_outbound() {
+	t=$(uci_get proxy.config_type); t=${t:-outbound}
+	case "$t" in
+		url)
+			u=$(uci_get proxy.proxy_url); [ -z "$u" ] && return 1
+			link_to_outbound "$u" ;;
+		subscription)
+			L=$(sub_pick); [ -z "$L" ] && { echo "fortochka: подписка пуста — обнови её" >&2; return 1; }
+			link_to_outbound "$L" ;;
+		*)
+			uci_get proxy.outbound_json ;;
+	esac
+}
+
+# генерация конфига Xray
+gen_xray() {
+	load_main
+	command -v jq >/dev/null 2>&1 || { echo "fortochka: нужен jq (apk add jq)"; return 1; }
+	OUT=$(gen_outbound)
+	[ -z "$OUT" ] && { echo "fortochka: outbound не задан (config_type/outbound_json/proxy_url)"; return 1; }
+	# принудительно tag=proxy и sockopt.mark=255 (анти-петля TPROXY)
+	OUT=$(printf '%s' "$OUT" | jq -c '
+		.tag = "proxy"
+		| .streamSettings = (.streamSettings // {})
+		| .streamSettings.sockopt = (.streamSettings.sockopt // {})
+		| .streamSettings.sockopt.mark = 255
+	' 2>/dev/null)
+	[ -z "$OUT" ] && { echo "fortochka: outbound_json — невалидный JSON"; return 1; }
+
+	mkdir -p "$(dirname "$XRAY_CFG")"
+	cat > "$XRAY_CFG" <<EOF
+{
+  "log": { "loglevel": "$LOGLEVEL" },
+  "policy": { "levels": { "0": { "bufferSize": 128, "connIdle": 300 } }, "system": { "statsInboundUplink": false, "statsInboundDownlink": false } },
+  "inbounds": [
+    {
+      "tag": "tproxy4", "listen": "127.0.0.1", "port": $PORT, "protocol": "dokodemo-door",
+      "settings": { "network": "tcp,udp", "followRedirect": true },
+      "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
+      "sniffing": { "enabled": false }
+    },
+    {
+      "tag": "tproxy6", "listen": "::1", "port": $PORT, "protocol": "dokodemo-door",
+      "settings": { "network": "tcp,udp", "followRedirect": true },
+      "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
+      "sniffing": { "enabled": false }
+    },
+    {
+      "tag": "socks-in", "listen": "127.0.0.1", "port": $SOCKS_PORT, "protocol": "socks",
+      "settings": { "udp": true }
+    }
+  ],
+  "outbounds": [ $OUT ]
+}
+EOF
+}
+
+# списки доменов / подсетей (из файлов)
+build_domains() {
+	[ -f "$DOMAINS_FILE" ]   && grep -vE '^[[:space:]]*(#|$)' "$DOMAINS_FILE"
+	[ -f "$REMOTE_DOMAINS" ] && grep -vE '^[[:space:]]*(#|$)' "$REMOTE_DOMAINS"
+}
+
+collect_subnets() {
+	[ -f "$SUBNETS_FILE" ]   && grep -vE '^[[:space:]]*(#|$)' "$SUBNETS_FILE"
+	[ -f "$REMOTE_SUBNETS" ] && grep -vE '^[[:space:]]*(#|$)' "$REMOTE_SUBNETS"
+}
+
+# IP/подсети, которые всегда идут напрямую, мимо туннеля (исключения)
+collect_exclude() {
+	[ -f "$EXCLUDE_FILE" ] && grep -vE '^[[:space:]]*(#|$)' "$EXCLUDE_FILE"
+}
+
+# dnsmasq в OpenWrt стартует в ujail и монтирует только заданный confdir.
+ensure_dnsmasq_confdir() {
+	cur=$(uci -q get dhcp.@dnsmasq[0].confdir)
+	if [ "$cur" != "$DNSMASQ_DIR" ]; then
+		uci set dhcp.@dnsmasq[0].confdir="$DNSMASQ_DIR"
+		uci commit dhcp
+	fi
+}
+
+gen_dnsmasq() {
+	load_main
+	ensure_dnsmasq_confdir
+	mkdir -p "$DNSMASQ_DIR"
+	: > "$DNSMASQ_CONF"
+	# если DNS включён — заблок-домены резолвим через чистый dnsproxy (127.0.0.1:5353),
+	# чтобы провайдер не подменял их IP (иначе в nftset попадает мусор)
+	FWD=""
+	[ "$DNS_TYPE" != "off" ] && FWD="127.0.0.1#$DNS_PORT"
+	# батчим по 256 доменов на строку — иначе на больших списках dnsmasq давится
+	build_domains | sed 's/^\.//; s/[[:space:]]//g' | grep . | sort -u | awk -v t="$NFT_TABLE" -v fwd="$FWD" '
+		function emit() {
+			print "nftset=" buf "/4#inet#" t "#vpn4"
+			print "nftset=" buf "/6#inet#" t "#vpn6"
+			if (fwd != "") print "server=" buf "/" fwd
+			buf = ""
+		}
+		{ buf = buf "/" $0; c++; if (c % 256 == 0) emit() }
+		END { if (buf != "") emit() }' >> "$DNSMASQ_CONF"
+}
+
+# загрузка nftables
+load_nft() {
+	load_main
+	QUIC=""; QUIC4=""; QUIC6=""
+	NTP=""
+	[ "$EXCLUDE_NTP" = "1" ] && NTP="udp dport 123 return"
+	if [ "$NOQUIC" = "1" ]; then
+		if [ "$MODE" = "all" ]; then
+			QUIC="udp dport 443 reject"
+		else
+			QUIC4="udp dport 443 ip daddr @vpn4 reject"
+			QUIC6="udp dport 443 ip6 daddr @vpn6 reject"
+		fi
+	fi
+
+	if [ "$MODE" = "all" ]; then
+		RULE4="meta nfproto ipv4 meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:$PORT meta mark set $FWMARK accept"
+		RULE6="meta nfproto ipv6 meta l4proto { tcp, udp } tproxy ip6 to [::1]:$PORT meta mark set $FWMARK accept"
+	else
+		RULE4="meta l4proto { tcp, udp } ip daddr @vpn4 tproxy ip to 127.0.0.1:$PORT meta mark set $FWMARK accept"
+		RULE6="meta l4proto { tcp, udp } ip6 daddr @vpn6 tproxy ip6 to [::1]:$PORT meta mark set $FWMARK accept"
+	fi
+
+	# 1) таблица с пустыми сетами + правила (быстро, всегда успешно)
+	nft -f - <<EOF || return 1
+add table inet $NFT_TABLE
+delete table inet $NFT_TABLE
+add table inet $NFT_TABLE {
+	set vpn4 { type ipv4_addr; flags interval; auto-merge; }
+	set vpn6 { type ipv6_addr; flags interval; auto-merge; }
+	set direct4 { type ipv4_addr; flags interval; auto-merge; }
+	set direct6 { type ipv6_addr; flags interval; auto-merge; }
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+		meta mark 0xff return
+		fib daddr type local return
+		ip daddr @direct4 return
+		ip6 daddr @direct6 return
+		ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+		ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
+		$NTP
+		$QUIC
+		$QUIC4
+		$QUIC6
+		$RULE4
+		$RULE6
+	}
+}
+EOF
+
+	# 2) наполнение сетов статичными подсетями — чанками по 800, одним проходом awk.
+	#    ошибки наполнения не валят сервис (домены продолжают работать).
+	collect_subnets | sort -u | awk -v t="$NFT_TABLE" '
+		/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]+)?$/ {
+			v4 = v4 (v4?",":"") $0; n4++
+			if (n4 % 800 == 0) { print "add element inet " t " vpn4 { " v4 " }"; v4 = "" }
+			next
+		}
+		/:/ && /^[0-9a-fA-F:]+(\/[0-9]+)?$/ {
+			v6 = v6 (v6?",":"") $0; n6++
+			if (n6 % 800 == 0) { print "add element inet " t " vpn6 { " v6 " }"; v6 = "" }
+		}
+		END {
+			if (v4 != "") print "add element inet " t " vpn4 { " v4 " }"
+			if (v6 != "") print "add element inet " t " vpn6 { " v6 " }"
+		}' | nft -f - 2>/dev/null
+
+	# 3) исключения «всегда напрямую» -> direct4/direct6
+	collect_exclude | sort -u | awk -v t="$NFT_TABLE" '
+		/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]+)?$/ { d4 = d4 (d4?",":"") $0; next }
+		/:/ && /^[0-9a-fA-F:]+(\/[0-9]+)?$/        { d6 = d6 (d6?",":"") $0 }
+		END {
+			if (d4 != "") print "add element inet " t " direct4 { " d4 " }"
+			if (d6 != "") print "add element inet " t " direct6 { " d6 " }"
+		}' | nft -f - 2>/dev/null
+	return 0
+}
+
+setup_routes() {
+	load_main
+	ip rule add fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+	ip route add local default dev lo table "$TABLE" 2>/dev/null
+	ip -6 rule add fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+	ip -6 route add local default dev lo table "$TABLE" 2>/dev/null
+	return 0
+}
+
+teardown_routes() {
+	load_main
+	ip rule del fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+	ip route flush table "$TABLE" 2>/dev/null
+	ip -6 rule del fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+	ip -6 route flush table "$TABLE" 2>/dev/null
+	return 0
+}
+
+# apply = только сетевая обвязка + генерация конфигов. Xray поднимает procd (init.d).
+_apply() {
+	load_main
+	[ "$ENABLED" = "1" ] || { echo "fortochka: disabled"; down; return 0; }
+	[ "$MODE" = "off" ]  && { echo "fortochka: mode=off"; down; return 0; }
+	gen_xray || return 1
+	gen_dnsmasq
+	load_nft || { echo "fortochka: nft load FAILED (kmod-nft-tproxy?)"; return 1; }
+	setup_routes
+	cron_apply
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	echo "fortochka applied: mode=$MODE port=$PORT"
+}
+
+# блокировка: не даём двум apply идти одновременно (иначе роутер захлёбывается)
+apply() {
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK" 2>/dev/null
+		flock -n 9 2>/dev/null || { echo "fortochka: apply уже выполняется — пропуск"; return 0; }
+		_apply; rc=$?; exec 9>&- 2>/dev/null; return $rc
+	fi
+	_apply
+}
+
+down() {
+	nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && nft delete table inet "$NFT_TABLE"
+	teardown_routes
+	rm -f "$DNSMASQ_CONF"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	echo "fortochka: down"
+}
+
+fetch_url() {
+	if [ "$VIAPROXY" = "1" ] && command -v curl >/dev/null 2>&1; then
+		curl -fsL --max-time 90 --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$1" 2>/dev/null && return 0
+	fi
+	# curl основным (редиректы/https), uclient-fetch/wget как запасной
+	command -v curl >/dev/null 2>&1 && curl -fsL --max-time 90 "$1" 2>/dev/null && return 0
+	uclient-fetch -qO - "$1" 2>/dev/null || wget -qO - "$1" 2>/dev/null
+}
+
+update_lists() {
+	load_main
+	mkdir -p "$LIST_DIR"
+	# --- домены
+	: > "$REMOTE_DOMAINS"
+	if [ -s "$URL_DOMAINS" ]; then
+		while IFS= read -r u; do
+			case "$u" in ''|\#*) continue ;; esac
+			echo "domains <- $u" >&2
+			fetch_url "$u"
+			echo
+		done < "$URL_DOMAINS" \
+			| sed 's/#.*//; s#^https\?://##; s#/.*##; s/[[:space:]]//g' \
+			| grep -E '^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}$' \
+			| sort -u > "$REMOTE_DOMAINS"
+	fi
+	# --- подсети (CIDR)
+	: > "$REMOTE_SUBNETS"
+	if [ -s "$URL_SUBNETS" ]; then
+		while IFS= read -r u; do
+			case "$u" in ''|\#*) continue ;; esac
+			echo "subnets <- $u" >&2
+			fetch_url "$u"
+			echo
+		done < "$URL_SUBNETS" \
+			| sed 's/#.*//; s/[[:space:]]//g' \
+			| grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]+:[0-9a-fA-F:]*(/[0-9]{1,3})?$' \
+			| sort -u > "$REMOTE_SUBNETS"
+	fi
+	echo "fortochka: домены $(wc -l < "$REMOTE_DOMAINS" 2>/dev/null), подсети $(wc -l < "$REMOTE_SUBNETS" 2>/dev/null)"
+	# если outbound берётся из подписки — обновим и её
+	[ "$(uci_get proxy.config_type)" = "subscription" ] && _sub_fetch
+	# перечитать списки в nft/dnsmasq без перезапуска xray (конфиг xray не менялся)
+	apply
+}
+
+status() {
+	load_main
+	echo "enabled = $ENABLED    mode = $MODE    port = $PORT    log = $LOGLEVEL"
+	CT=$(uci_get proxy.config_type); CT=${CT:-outbound}
+	if [ "$CT" = "subscription" ]; then
+		SI=$(uci_get proxy.sub_interval); SI=${SI:-off}
+		echo "outbound: подписка ($(grep -c . "$SUB_FILE" 2>/dev/null) серв., автообн: $SI)"
+	else
+		echo "outbound: $CT"
+	fi
+	pidof xray >/dev/null 2>&1 && echo "xray    : running (pid $(pidof xray))" || echo "xray    : stopped"
+	nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && echo "nft     : loaded" || echo "nft     : absent"
+	dc=$(build_domains 2>/dev/null | grep -c .)
+	sc=$(collect_subnets 2>/dev/null | grep -c .)
+	echo "domains : $dc | subnets: $sc"
+	ip rule show 2>/dev/null | grep -q "fwmark" && echo "ip rule : ok" || echo "ip rule : MISSING"
+	echo "автообновление: $INTERVAL   |   скачивать через VPN: $VIAPROXY"
+	echo "DNS     : $DNS_TYPE${DNS_TYPE:+ ($DNS_MAIN)}   bootstrap: $DNS_BOOT"
+	pidof dnsproxy >/dev/null 2>&1 && echo "dnsproxy: running" || { [ "$DNS_TYPE" != off ] && echo "dnsproxy: STOPPED" ; }
+}
+
+# встроенный тест скорости туннеля (своя фишка)
+speedtest() {
+	pidof xray >/dev/null 2>&1 || { echo "xray не запущен"; return 1; }
+	echo "Тест через туннель (socks 127.0.0.1:$SOCKS_PORT), 50 МБ…"
+	S=$(curl -o /dev/null -s -w '%{speed_download}' --max-time 25 --socks5-hostname "127.0.0.1:$SOCKS_PORT" 'https://speed.cloudflare.com/__down?bytes=50000000')
+	[ -z "$S" ] || [ "$S" = "0" ] && { echo "не удалось — туннель не отвечает"; return 1; }
+	awk -v s="$S" 'BEGIN{ printf "1 поток: %.1f Мбит/с  (%.2f МБ/с)\n", s*8/1000000, s/1048576 }'
+	echo "(для справки: 1080p≈8, 1440p≈16, 4K≈25-45 Мбит/с)"
+}
+
+case "$1" in
+	apply)               apply ;;
+	down|stop)           down ;;
+	gen)                 gen_xray && gen_dnsmasq && echo "configs generated" ;;
+	nft)                 load_nft && echo "nft loaded" ;;
+	update|update-lists) update_lists ;;
+	sub-update)          sub_update ;;
+	cron)                load_main; cron_apply; echo "cron: $INTERVAL" ;;
+	logs)                show_logs ;;
+	speedtest)           speedtest ;;
+	dns-args)            dns_args ;;
+	status)              status ;;
+	*) echo "usage: fortochka {apply|down|gen|nft|update-lists|sub-update|cron|logs|speedtest|status}" ;;
+esac

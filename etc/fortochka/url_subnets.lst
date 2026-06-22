@@ -1,0 +1,3 @@
+# URL списков CIDR/подсетей (по одному в строке). Скачиваются по «Обновить списки».
+# Discord IPv4 (re:filter) — для голоса/реалтайма, которые по доменам не ловятся.
+https://raw.githubusercontent.com/1andrevich/Re-filter-lists/main/discord_ips.lst
