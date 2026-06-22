@@ -1,5 +1,6 @@
 # Fortochka
 
+Lightweight bypass router for OpenWrt.
 Engine is **Xray** (XHTTP / Vision / REALITY post-quantum); all routing and DNS
 live in the system (nft + dnsmasq + dnsproxy) — the engine is just a dumb outbound.
 
