@@ -591,15 +591,17 @@ watchdog() {
 # self-update с github (только код, конфиг/списки не трогаем)
 upgrade() {
 	echo "качаю свежую версию с github…"
-	d=/tmp/fortochka-up; rm -rf "$d"; mkdir -p "$d"
-	curl -fsSL "$TARBALL_URL" | tar -xz -C "$d" --strip-components=1 2>/dev/null || { echo "не скачалось"; return 1; }
-	[ -f "$d/usr/bin/fortochka" ] || { echo "битый архив"; return 1; }
-	cp "$d/usr/bin/fortochka" /usr/bin/fortochka
-	cp "$d/etc/init.d/fortochka" /etc/init.d/fortochka
+	curl -fsSL "$TARBALL_URL" -o /tmp/ft.tgz || { echo "не скачалось"; return 1; }
+	rm -rf /tmp/ft-up; mkdir -p /tmp/ft-up
+	tar -xzf /tmp/ft.tgz -C /tmp/ft-up 2>/dev/null || { echo "битый архив"; return 1; }
+	d=$(ls -d /tmp/ft-up/*/ 2>/dev/null | head -1)
+	[ -n "$d" ] && [ -f "${d}usr/bin/fortochka" ] || { echo "битый архив"; return 1; }
+	cp "${d}usr/bin/fortochka" /usr/bin/fortochka
+	cp "${d}etc/init.d/fortochka" /etc/init.d/fortochka
 	mkdir -p /usr/share/luci/menu.d /usr/share/rpcd/acl.d /www/luci-static/resources/view/fortochka
-	cp "$d"/usr/share/luci/menu.d/* /usr/share/luci/menu.d/ 2>/dev/null
-	cp "$d"/usr/share/rpcd/acl.d/* /usr/share/rpcd/acl.d/ 2>/dev/null
-	cp "$d"/www/luci-static/resources/view/fortochka/* /www/luci-static/resources/view/fortochka/ 2>/dev/null
+	cp "${d}"usr/share/luci/menu.d/* /usr/share/luci/menu.d/ 2>/dev/null
+	cp "${d}"usr/share/rpcd/acl.d/* /usr/share/rpcd/acl.d/ 2>/dev/null
+	cp "${d}"www/luci-static/resources/view/fortochka/* /www/luci-static/resources/view/fortochka/ 2>/dev/null
 	sed -i 's/\r$//' /usr/bin/fortochka /etc/init.d/fortochka
 	chmod +x /usr/bin/fortochka /etc/init.d/fortochka
 	rm -f /tmp/luci-indexcache*; rm -rf /tmp/luci-modulecache

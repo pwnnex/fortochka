@@ -10,9 +10,10 @@ TARBALL="https://github.com/pwnnex/fortochka/archive/refs/heads/main.tar.gz"
 if [ ! -f usr/bin/fortochka ]; then
 	echo "[*] fetching fortochka from github..."
 	command -v curl >/dev/null 2>&1 || { opkg update >/dev/null 2>&1 || apk update >/dev/null 2>&1; (apk add curl || opkg install curl) >/dev/null 2>&1 || true; }
-	d=/tmp/fortochka-src; rm -rf "$d"; mkdir -p "$d"
-	curl -fsSL "$TARBALL" | tar -xz -C "$d" --strip-components=1 || { echo "download failed"; exit 1; }
-	cd "$d"
+	curl -fsSL "$TARBALL" -o /tmp/ft.tgz || { echo "download failed"; exit 1; }
+	rm -rf /tmp/fortochka-src; mkdir -p /tmp/fortochka-src
+	tar -xzf /tmp/ft.tgz -C /tmp/fortochka-src || { echo "extract failed"; exit 1; }
+	cd "$(ls -d /tmp/fortochka-src/*/ | head -1)"
 fi
 
 echo "[1/6] dependencies..."
