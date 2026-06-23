@@ -121,8 +121,8 @@ return view.extend({
 			poll.add(function() {
 				return fs.exec('/usr/bin/fortochka', [ 'status' ]).then(function(r) {
 					var el = document.getElementById('ft-status');
-					if (el) el.textContent = (r && r.stdout) ? r.stdout : _('no data');
-				});
+					if (el && r && r.stdout) el.textContent = r.stdout;
+				}).catch(function() {});
 			}, 10);
 
 			// live speed from xray stats (byte counters delta)
@@ -137,7 +137,7 @@ return view.extend({
 						el.textContent = '↑ ' + fmtSpeed((up - pUp) / dt) + '   ↓ ' + fmtSpeed((dn - pDn) / dt);
 					}
 					pUp = up; pDn = dn; pT = t;
-				});
+				}).catch(function() {});
 			}, 3);
 
 			// exit ip + flag (once)
@@ -145,7 +145,7 @@ return view.extend({
 				var p = (((r && r.stdout) || '- --').trim().split(/\s+/));
 				var el = document.getElementById('ft-exit');
 				if (el) el.textContent = p[0] + ' ' + flag(p[1]);
-			});
+			}).catch(function() {});
 
 			return E('div', { 'class': 'cbi-section' }, [
 				E('h3', '🪟 ' + _('Status')),

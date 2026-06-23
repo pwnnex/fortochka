@@ -466,6 +466,8 @@ _apply() {
 	load_nft || { echo "fortochka: nft load FAILED (kmod-nft-tproxy?)"; return 1; }
 	setup_routes
 	cron_apply
+	# кешируем счётчики, чтоб status не читал 100k+ строк на каждый вызов
+	printf 'CNT_DOM=%s\nCNT_SUB=%s\n' "$(build_domains 2>/dev/null | grep -c .)" "$(collect_subnets 2>/dev/null | grep -c .)" > /tmp/fortochka.counts 2>/dev/null
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
 	echo "fortochka applied: mode=$MODE port=$PORT"
 }
@@ -543,11 +545,10 @@ status() {
 	else
 		echo "outbound: $CT"
 	fi
-	pidof xray >/dev/null 2>&1 && echo "xray    : running (pid $(pidof xray))" || echo "xray    : stopped"
-	nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && echo "nft     : loaded" || echo "nft     : absent"
-	dc=$(build_domains 2>/dev/null | grep -c .)
-	sc=$(collect_subnets 2>/dev/null | grep -c .)
-	echo "domains : $dc | subnets: $sc"
+	xp=$(pidof xray); [ -n "$xp" ] && echo "xray    : running (pid $xp)" || echo "xray    : stopped"
+	nft list tables 2>/dev/null | grep -q "inet $NFT_TABLE" && echo "nft     : loaded" || echo "nft     : absent"
+	CNT_DOM=0; CNT_SUB=0; [ -f /tmp/fortochka.counts ] && . /tmp/fortochka.counts
+	echo "domains : $CNT_DOM | subnets: $CNT_SUB"
 	ip rule show 2>/dev/null | grep -q "fwmark" && echo "ip rule : ok" || echo "ip rule : MISSING"
 	echo "lists auto-update: $INTERVAL   |   download via VPN: $VIAPROXY"
 	echo "DNS     : $DNS_TYPE${DNS_TYPE:+ ($DNS_MAIN)}   bootstrap: $DNS_BOOT"
