@@ -200,10 +200,17 @@ _sub_fetch() {
 	LINKS=$(printf '%s\n' "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
 	[ -z "$LINKS" ] && LINKS=$(b64blob "$RAW" | grep -oE '(vless|vmess|trojan|ss)://[^[:space:]"<]+')
 	mkdir -p "$LIST_DIR"
-	printf '%s\n' "$LINKS" | grep . > "$SUB_FILE"
-	N=$(grep -c . "$SUB_FILE" 2>/dev/null)
-	echo "fortochka: subscription: $N servers" >&2
-	[ "${N:-0}" -gt 0 ]
+	# атомарно: пишем во временный, заменяем только если непусто — иначе
+	# неудачный фетч затрёт рабочий sub.lst и следующий apply уронит туннель
+	printf '%s\n' "$LINKS" | grep . > "$SUB_FILE.tmp"
+	if [ -s "$SUB_FILE.tmp" ]; then
+		mv "$SUB_FILE.tmp" "$SUB_FILE"
+		echo "fortochka: subscription: $(grep -c . "$SUB_FILE") servers" >&2
+		return 0
+	fi
+	rm -f "$SUB_FILE.tmp"
+	echo "fortochka: empty subscription, keeping previous" >&2
+	return 1
 }
 
 # выбрать ссылку из подписки (по номеру, имени или первую)
@@ -502,8 +509,9 @@ fetch_url() {
 update_lists() {
 	load_main
 	mkdir -p "$LIST_DIR"
+	# атомарно: пишем во временные, заменяем только если непусто — иначе
+	# упавшее скачивание обнулит списки и нужные домены выпадут из nftset
 	# --- домены
-	: > "$REMOTE_DOMAINS"
 	if [ -s "$URL_DOMAINS" ]; then
 		while IFS= read -r u; do
 			case "$u" in ''|\#*) continue ;; esac
@@ -513,10 +521,10 @@ update_lists() {
 		done < "$URL_DOMAINS" \
 			| sed 's/#.*//; s#^https\?://##; s#/.*##; s/[[:space:]]//g' \
 			| grep -E '^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}$' \
-			| sort -u > "$REMOTE_DOMAINS"
+			| sort -u > "$REMOTE_DOMAINS.tmp"
+		[ -s "$REMOTE_DOMAINS.tmp" ] && mv "$REMOTE_DOMAINS.tmp" "$REMOTE_DOMAINS" || rm -f "$REMOTE_DOMAINS.tmp"
 	fi
 	# --- подсети (CIDR)
-	: > "$REMOTE_SUBNETS"
 	if [ -s "$URL_SUBNETS" ]; then
 		while IFS= read -r u; do
 			case "$u" in ''|\#*) continue ;; esac
@@ -526,7 +534,8 @@ update_lists() {
 		done < "$URL_SUBNETS" \
 			| sed 's/#.*//; s/[[:space:]]//g' \
 			| grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]+:[0-9a-fA-F:]*(/[0-9]{1,3})?$' \
-			| sort -u > "$REMOTE_SUBNETS"
+			| sort -u > "$REMOTE_SUBNETS.tmp"
+		[ -s "$REMOTE_SUBNETS.tmp" ] && mv "$REMOTE_SUBNETS.tmp" "$REMOTE_SUBNETS" || rm -f "$REMOTE_SUBNETS.tmp"
 	fi
 	echo "fortochka: domains $(wc -l < "$REMOTE_DOMAINS" 2>/dev/null), subnets $(wc -l < "$REMOTE_SUBNETS" 2>/dev/null)"
 	# если outbound берётся из подписки — обновим и её
@@ -578,15 +587,24 @@ exit_info() {
 	echo "$ip ${cc:-??}"
 }
 
-# watchdog: жив ли туннель; если нет — рестарт и запись в health-файл
+# watchdog: жив ли туннель; если нет — рестарт и запись в health-файл.
+# два захода: сначала просто рестарт; если и после него мёртв и это подписка —
+# обновляем её (вдруг сервер сменился) и рестартим ещё раз
+probe() { curl -fsS --max-time 8 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://www.gstatic.com/generate_204 -o /dev/null 2>/dev/null; }
+# чистый dns-резолвер жив? (иначе заблок-домены не попадают в nftset и сайт не грузится)
+dns_ok() { [ "$DNS_TYPE" = "off" ] && return 0; nslookup -port=$DNS_PORT google.com 127.0.0.1 >/dev/null 2>&1; }
 watchdog() {
 	load_main
-	if curl -fsS --max-time 8 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://www.gstatic.com/generate_204 -o /dev/null 2>/dev/null; then
-		return 0
-	fi
+	probe && dns_ok && return 0
 	n=$(sed -n 's/^restarts=//p' "$HEALTH_FILE" 2>/dev/null); n=$((${n:-0}+1))
 	printf 'lastfail=%s\nrestarts=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" > "$HEALTH_FILE"
 	/etc/init.d/fortochka restart
+	sleep 6
+	probe && dns_ok && return 0
+	# всё ещё мёртв — для подписки пробуем подтянуть свежий сервер
+	if [ "$(uci_get proxy.config_type)" = "subscription" ]; then
+		_sub_fetch >/dev/null 2>&1 && /etc/init.d/fortochka restart
+	fi
 }
 
 # self-update с github (только код, конфиг/списки не трогаем)
