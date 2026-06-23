@@ -272,6 +272,10 @@ return view.extend({
 		o.value('daily', _('Daily'));
 		o.value('weekly', _('Weekly'));
 
+		o = s.option(form.Flag, 'failover', _('Auto-failover'),
+			_('Use ALL servers from the subscription; Xray keeps the fastest alive one (least-ping) and switches on failure. Needs 2+ servers.'));
+		o.depends('config_type', 'subscription');
+
 		o = s.option(form.TextValue, 'outbound_json', _('Outbound JSON'),
 			_('Full Xray outbound object (network/security/sockopt etc.)'));
 		o.depends('config_type', 'outbound');

@@ -253,27 +253,47 @@ gen_outbound() {
 	esac
 }
 
+# все серверы подписки как outbounds proxy-0..N (для авто-фейловера)
+build_failover_outbounds() {
+	i=0; arr=""
+	while IFS= read -r L; do
+		[ -z "$L" ] && continue
+		O=$(link_to_outbound "$L" 2>/dev/null | jq -c --arg t "proxy-$i" '.tag=$t | .streamSettings=(.streamSettings//{}) | .streamSettings.sockopt=(.streamSettings.sockopt//{}) | .streamSettings.sockopt.mark=255' 2>/dev/null)
+		[ -z "$O" ] && continue
+		arr="${arr:+$arr,}$O"; i=$((i+1))
+	done < "$SUB_FILE"
+	[ "$i" -gt 0 ] && echo "$arr"
+}
+
 # генерация конфига Xray
 gen_xray() {
 	load_main
 	command -v jq >/dev/null 2>&1 || { echo "fortochka: jq required (apk add jq)"; return 1; }
-	OUT=$(gen_outbound)
-	[ -z "$OUT" ] && { echo "fortochka: no outbound set (config_type/outbound_json/proxy_url)"; return 1; }
-	# принудительно tag=proxy и sockopt.mark=255 (анти-петля TPROXY)
-	OUT=$(printf '%s' "$OUT" | jq -c '
-		.tag = "proxy"
-		| .streamSettings = (.streamSettings // {})
-		| .streamSettings.sockopt = (.streamSettings.sockopt // {})
-		| .streamSettings.sockopt.mark = 255
-	' 2>/dev/null)
-	[ -z "$OUT" ] && { echo "fortochka: invalid outbound JSON"; return 1; }
+	CT=$(uci_get proxy.config_type); CT=${CT:-outbound}
+	FAILOVER=$(uci_get proxy.failover); FAILOVER=${FAILOVER:-0}
+	OBS=""; RROUTE=""; RBAL=""
+	if [ "$CT" = "subscription" ] && [ "$FAILOVER" = "1" ] && [ "$(grep -c . "$SUB_FILE" 2>/dev/null)" -gt 1 ]; then
+		# фейловер: все серверы + balancer least-ping + observatory
+		OUTBOUNDS=$(build_failover_outbounds)
+		[ -z "$OUTBOUNDS" ] && { echo "fortochka: failover: no valid servers"; return 1; }
+		OBS=', "observatory": { "subjectSelector": ["proxy-"], "probeURL": "https://www.gstatic.com/generate_204", "probeInterval": "30s" }'
+		RROUTE=', { "type": "field", "inboundTag": ["tproxy4","tproxy6","socks-in"], "balancerTag": "auto" }'
+		RBAL=', "balancers": [ { "tag": "auto", "selector": ["proxy-"], "strategy": { "type": "leastPing" } } ]'
+	else
+		OUT=$(gen_outbound)
+		[ -z "$OUT" ] && { echo "fortochka: no outbound set (config_type/outbound_json/proxy_url)"; return 1; }
+		# tag=proxy + sockopt.mark=255 (анти-петля TPROXY)
+		OUT=$(printf '%s' "$OUT" | jq -c '.tag="proxy" | .streamSettings=(.streamSettings//{}) | .streamSettings.sockopt=(.streamSettings.sockopt//{}) | .streamSettings.sockopt.mark=255' 2>/dev/null)
+		[ -z "$OUT" ] && { echo "fortochka: invalid outbound JSON"; return 1; }
+		OUTBOUNDS="$OUT"
+	fi
 
 	mkdir -p "$(dirname "$XRAY_CFG")"
 	cat > "$XRAY_CFG" <<EOF
 {
   "log": { "loglevel": "$LOGLEVEL" },
   "stats": {},
-  "api": { "tag": "api", "services": [ "StatsService" ] },
+  "api": { "tag": "api", "services": [ "StatsService" ] }$OBS,
   "policy": { "levels": { "0": { "bufferSize": 128, "connIdle": 300 } }, "system": { "statsOutboundUplink": true, "statsOutboundDownlink": true } },
   "inbounds": [
     {
@@ -297,8 +317,8 @@ gen_xray() {
       "settings": { "address": "127.0.0.1" }
     }
   ],
-  "outbounds": [ $OUT ],
-  "routing": { "rules": [ { "type": "field", "inboundTag": [ "api-in" ], "outboundTag": "api" } ] }
+  "outbounds": [ $OUTBOUNDS ],
+  "routing": { "rules": [ { "type": "field", "inboundTag": [ "api-in" ], "outboundTag": "api" }$RROUTE ]$RBAL }
 }
 EOF
 }
@@ -588,8 +608,8 @@ status() {
 stats() {
 	pidof xray >/dev/null 2>&1 || { echo "0 0"; return; }
 	J=$(xray api statsquery --server="127.0.0.1:$API_PORT" 2>/dev/null)
-	up=$(echo "$J" | jq -r '.stat[]? | select(.name=="outbound>>>proxy>>>traffic>>>uplink") | .value' 2>/dev/null)
-	dn=$(echo "$J" | jq -r '.stat[]? | select(.name=="outbound>>>proxy>>>traffic>>>downlink") | .value' 2>/dev/null)
+	up=$(echo "$J" | jq -r '[.stat[]? | select(.name|test("^outbound>>>proxy.*>>>uplink$")) | (.value|tonumber)] | add // 0' 2>/dev/null)
+	dn=$(echo "$J" | jq -r '[.stat[]? | select(.name|test("^outbound>>>proxy.*>>>downlink$")) | (.value|tonumber)] | add // 0' 2>/dev/null)
 	echo "${up:-0} ${dn:-0}"
 }
 

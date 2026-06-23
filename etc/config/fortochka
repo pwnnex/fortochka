@@ -23,6 +23,7 @@ config outbound 'proxy'
 	option sub_url ''
 	option sub_select ''
 	option sub_interval 'off'
+	option failover '0'
 	option outbound_json '{"protocol":"vless","settings":{"vnext":[{"address":"YOUR_SERVER","port":443,"users":[{"id":"YOUR_UUID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"YOUR_PUBLIC_KEY","shortId":"","fingerprint":"chrome"}}}'
 
 # списки и url-источники лежат в /etc/fortochka/*.lst (правятся в панели)
