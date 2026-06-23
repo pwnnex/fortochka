@@ -230,7 +230,7 @@ sub_update() {
 	_sub_fetch || { echo "fortochka: subscription empty / not fetched"; return 1; }
 	# не рестартим xray, если серверы те же
 	H=$(md5sum < "$SUB_FILE" 2>/dev/null | cut -d' ' -f1)
-	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.subhash" 2>/dev/null)" ]; then
+	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.subhash" 2>/dev/null)" ] && pidof xray >/dev/null 2>&1; then
 		echo "fortochka: subscription unchanged, skip"
 		return 0
 	fi
@@ -549,7 +549,7 @@ update_lists() {
 	[ "$(uci_get proxy.config_type)" = "subscription" ] && _sub_fetch
 	# не переприменяем, если ничего не поменялось (на упавшем фетче данные те же)
 	H=$(cat "$DOMAINS_FILE" "$REMOTE_DOMAINS" "$SUBNETS_FILE" "$REMOTE_SUBNETS" "$EXCLUDE_FILE" "$SUB_FILE" 2>/dev/null | md5sum | cut -d' ' -f1)
-	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.applyhash" 2>/dev/null)" ]; then
+	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.applyhash" 2>/dev/null)" ] && pidof xray >/dev/null 2>&1; then
 		echo "fortochka: nothing changed, skip reapply"
 		return 0
 	fi
