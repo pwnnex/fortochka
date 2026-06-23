@@ -228,6 +228,13 @@ sub_pick() {
 
 sub_update() {
 	_sub_fetch || { echo "fortochka: subscription empty / not fetched"; return 1; }
+	# не рестартим xray, если серверы те же
+	H=$(md5sum < "$SUB_FILE" 2>/dev/null | cut -d' ' -f1)
+	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.subhash" 2>/dev/null)" ]; then
+		echo "fortochka: subscription unchanged, skip"
+		return 0
+	fi
+	echo "$H" > "$LIST_DIR/.subhash"
 	apply
 }
 
@@ -540,7 +547,13 @@ update_lists() {
 	echo "fortochka: domains $(wc -l < "$REMOTE_DOMAINS" 2>/dev/null), subnets $(wc -l < "$REMOTE_SUBNETS" 2>/dev/null)"
 	# если outbound берётся из подписки — обновим и её
 	[ "$(uci_get proxy.config_type)" = "subscription" ] && _sub_fetch
-	# перечитать списки в nft/dnsmasq без перезапуска xray (конфиг xray не менялся)
+	# не переприменяем, если ничего не поменялось (на упавшем фетче данные те же)
+	H=$(cat "$DOMAINS_FILE" "$REMOTE_DOMAINS" "$SUBNETS_FILE" "$REMOTE_SUBNETS" "$EXCLUDE_FILE" "$SUB_FILE" 2>/dev/null | md5sum | cut -d' ' -f1)
+	if [ -n "$H" ] && [ "$H" = "$(cat "$LIST_DIR/.applyhash" 2>/dev/null)" ]; then
+		echo "fortochka: nothing changed, skip reapply"
+		return 0
+	fi
+	echo "$H" > "$LIST_DIR/.applyhash"
 	apply
 }
 
@@ -562,6 +575,8 @@ status() {
 	echo "lists auto-update: $INTERVAL   |   download via VPN: $VIAPROXY"
 	echo "DNS     : $DNS_TYPE${DNS_TYPE:+ ($DNS_MAIN)}   bootstrap: $DNS_BOOT"
 	pidof dnsproxy >/dev/null 2>&1 && echo "dnsproxy: running" || { [ "$DNS_TYPE" != off ] && echo "dnsproxy: STOPPED" ; }
+	ma=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null); mt=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+	echo "memory  : ${ma:-?}M free / ${mt:-?}M"
 	WD=$(uci_get main.watchdog); WD=${WD:-off}
 	wdi=""; [ -f "$HEALTH_FILE" ] && wdi="  (last fail $(sed -n 's/^lastfail=//p' "$HEALTH_FILE" 2>/dev/null), restarts $(sed -n 's/^restarts=//p' "$HEALTH_FILE" 2>/dev/null))"
 	echo "watchdog: $WD$wdi"
