@@ -33,6 +33,13 @@ Then: **LuCI → Services → Fortochka** → set your server (Outbound) → Sav
 The installer pulls deps: `xray-core kmod-nft-tproxy dnsmasq-full dnsproxy curl
 coreutils-base64 luci-base`. Needs ~25 MB free in /overlay.
 
+## Uninstall
+```
+sh -c "$(curl -sSL https://raw.githubusercontent.com/pwnnex/fortochka/main/uninstall.sh)"
+```
+Removes files, config, service, cron and the nft table, and restores dnsmasq.
+Dependency packages are left installed.
+
 ## CLI
 ```
 fortochka status | apply | down | speedtest
