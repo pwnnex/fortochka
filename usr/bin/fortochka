@@ -35,6 +35,8 @@ load_main() {
 	FWMARK=$(uci_get main.fwmark);       FWMARK=${FWMARK:-1}
 	TABLE=$(uci_get main.route_table);   TABLE=${TABLE:-100}
 	NOQUIC=$(uci_get main.disable_quic); NOQUIC=${NOQUIC:-1}
+	IPV6=$(uci_get main.ipv6); IPV6=${IPV6:-1}
+	KILL=$(uci_get main.killswitch); KILL=${KILL:-0}
 	INTERVAL=$(uci_get main.update_interval); INTERVAL=${INTERVAL:-off}
 	LOGLEVEL=$(uci_get main.log_level); LOGLEVEL=${LOGLEVEL:-warning}
 	VIAPROXY=$(uci_get main.download_via_proxy); VIAPROXY=${VIAPROXY:-0}
@@ -271,13 +273,27 @@ gen_xray() {
 	command -v jq >/dev/null 2>&1 || { echo "fortochka: jq required (apk add jq)"; return 1; }
 	CT=$(uci_get proxy.config_type); CT=${CT:-outbound}
 	FAILOVER=$(uci_get proxy.failover); FAILOVER=${FAILOVER:-0}
+	# inbound tproxy6 (::1) и теги фейловера зависят от тумблера ipv6
+	if [ "$IPV6" = "1" ]; then
+		INBOUND6='    {
+      "tag": "tproxy6", "listen": "::1", "port": '"$PORT"', "protocol": "dokodemo-door",
+      "settings": { "network": "tcp,udp", "followRedirect": true },
+      "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
+      "sniffing": { "enabled": false }
+    },
+'
+		FO_TAGS='"tproxy4","tproxy6","socks-in"'
+	else
+		INBOUND6=""
+		FO_TAGS='"tproxy4","socks-in"'
+	fi
 	OBS=""; RROUTE=""; RBAL=""
 	if [ "$CT" = "subscription" ] && [ "$FAILOVER" = "1" ] && [ "$(grep -c . "$SUB_FILE" 2>/dev/null)" -gt 1 ]; then
 		# фейловер: все серверы + balancer least-ping + observatory
 		OUTBOUNDS=$(build_failover_outbounds)
 		[ -z "$OUTBOUNDS" ] && { echo "fortochka: failover: no valid servers"; return 1; }
 		OBS=', "observatory": { "subjectSelector": ["proxy-"], "probeURL": "https://www.gstatic.com/generate_204", "probeInterval": "30s" }'
-		RROUTE=', { "type": "field", "inboundTag": ["tproxy4","tproxy6","socks-in"], "balancerTag": "auto" }'
+		RROUTE=', { "type": "field", "inboundTag": ['"$FO_TAGS"'], "balancerTag": "auto" }'
 		RBAL=', "balancers": [ { "tag": "auto", "selector": ["proxy-"], "strategy": { "type": "leastPing" } } ]'
 	else
 		OUT=$(gen_outbound)
@@ -302,13 +318,7 @@ gen_xray() {
       "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
       "sniffing": { "enabled": false }
     },
-    {
-      "tag": "tproxy6", "listen": "::1", "port": $PORT, "protocol": "dokodemo-door",
-      "settings": { "network": "tcp,udp", "followRedirect": true },
-      "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
-      "sniffing": { "enabled": false }
-    },
-    {
+$INBOUND6    {
       "tag": "socks-in", "listen": "127.0.0.1", "port": $SOCKS_PORT, "protocol": "socks",
       "settings": { "udp": true }
     },
@@ -358,10 +368,10 @@ gen_dnsmasq() {
 	FWD=""
 	[ "$DNS_TYPE" != "off" ] && FWD="127.0.0.1#$DNS_PORT"
 	# батчим по 256 доменов на строку — иначе на больших списках dnsmasq давится
-	build_domains | sed 's/^\.//; s/[[:space:]]//g' | grep . | sort -u | awk -v t="$NFT_TABLE" -v fwd="$FWD" '
+	build_domains | sed 's/^\.//; s/[[:space:]]//g' | grep . | sort -u | awk -v t="$NFT_TABLE" -v fwd="$FWD" -v v6="$IPV6" '
 		function emit() {
 			print "nftset=" buf "/4#inet#" t "#vpn4"
-			print "nftset=" buf "/6#inet#" t "#vpn6"
+			if (v6 == "1") print "nftset=" buf "/6#inet#" t "#vpn6"
 			if (fwd != "") print "server=" buf "/" fwd
 			buf = ""
 		}
@@ -392,6 +402,9 @@ load_nft() {
 		RULE6="meta l4proto { tcp, udp } ip6 daddr @vpn6 tproxy ip6 to [::1]:$PORT meta mark set $FWMARK accept"
 	fi
 
+	# ipv6 выключен — не перехватываем v6 (нет inbound ::1), чтоб трафик не висел
+	if [ "$IPV6" != "1" ]; then RULE6=""; QUIC6=""; fi
+
 	# правила по устройствам (источник: ip / ip6 / mac)
 	#   dev_direct.lst — устройство всегда напрямую; dev_proxy.lst — целиком в туннель
 	dev_block() {
@@ -401,19 +414,47 @@ load_nft() {
 			if echo "$e" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then sel="ether saddr $e"
 			elif echo "$e" | grep -q ':'; then sel="ip6 saddr $e"
 			else sel="ip saddr $e"; fi
+			# ipv6 выключен — v6-адрес устройства пропускаем (нет inbound ::1)
+			[ "$IPV6" != "1" ] && case "$sel" in ip6\ *) continue ;; esac
 			if [ "$2" = direct ]; then
 				printf '\t\t%s return\n' "$sel"
 			else
 				case "$sel" in
 					ip6\ *)  printf '\t\t%s meta l4proto { tcp, udp } tproxy ip6 to [::1]:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" ;;
 					ip\ *)   printf '\t\t%s meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" ;;
-					ether*)  printf '\t\t%s meta nfproto ipv4 meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%s meta mark set %s accept\n\t\t%s meta nfproto ipv6 meta l4proto { tcp, udp } tproxy ip6 to [::1]:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" "$sel" "$PORT" "$FWMARK" ;;
+					ether*)  printf '\t\t%s meta nfproto ipv4 meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK"
+					         [ "$IPV6" = "1" ] && printf '\t\t%s meta nfproto ipv6 meta l4proto { tcp, udp } tproxy ip6 to [::1]:%s meta mark set %s accept\n' "$sel" "$PORT" "$FWMARK" ;;
 				esac
 			fi
 		done < "$1"
 	}
 	DEV_DIRECT=$(dev_block "$DEV_DIRECT_FILE" direct)
 	DEV_PROXY=$(dev_block "$DEV_PROXY_FILE" proxy)
+
+	# kill-switch: туннелируемое съедается на prerouting (tproxy), поэтому до forward
+	# долетает лишь то, что должно было уйти в туннель, но не ушло (xray мёртв и т.п.).
+	# режем его, чтоб не утекло напрямую к провайдеру. all -> рубим всё, что не локалка/
+	# не direct; domains -> рубим только @vpn4/@vpn6. свой трафик xray (mark 0xff) и
+	# уже установленные сессии не трогаем.
+	KILLCHAIN=""
+	if [ "$KILL" = "1" ]; then
+		if [ "$MODE" = "all" ]; then KDROP4="meta nfproto ipv4 drop"; KDROP6="meta nfproto ipv6 drop"
+		else KDROP4="ip daddr @vpn4 drop"; KDROP6="ip6 daddr @vpn6 drop"; fi
+		[ "$IPV6" = "1" ] || KDROP6=""
+		KILLCHAIN="
+	chain killswitch {
+		type filter hook forward priority 10; policy accept;
+		meta mark 0xff return
+		ct state established,related accept
+		fib daddr type local return
+		ip daddr @direct4 return
+		ip6 daddr @direct6 return
+		ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+		ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
+		$KDROP4
+		$KDROP6
+	}"
+	fi
 
 	# 1) таблица с пустыми сетами + правила (быстро, всегда успешно)
 	nft -f - <<EOF || return 1
@@ -440,19 +481,19 @@ $DEV_PROXY
 		$QUIC6
 		$RULE4
 		$RULE6
-	}
+	}$KILLCHAIN
 }
 EOF
 
 	# 2) наполнение сетов статичными подсетями — чанками по 800, одним проходом awk.
 	#    ошибки наполнения не валят сервис (домены продолжают работать).
-	collect_subnets | sort -u | awk -v t="$NFT_TABLE" '
+	collect_subnets | sort -u | awk -v t="$NFT_TABLE" -v use6="$IPV6" '
 		/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]+)?$/ {
 			v4 = v4 (v4?",":"") $0; n4++
 			if (n4 % 800 == 0) { print "add element inet " t " vpn4 { " v4 " }"; v4 = "" }
 			next
 		}
-		/:/ && /^[0-9a-fA-F:]+(\/[0-9]+)?$/ {
+		use6 == "1" && /:/ && /^[0-9a-fA-F:]+(\/[0-9]+)?$/ {
 			v6 = v6 (v6?",":"") $0; n6++
 			if (n6 % 800 == 0) { print "add element inet " t " vpn6 { " v6 " }"; v6 = "" }
 		}
@@ -476,8 +517,14 @@ setup_routes() {
 	load_main
 	ip rule add fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
 	ip route add local default dev lo table "$TABLE" 2>/dev/null
-	ip -6 rule add fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
-	ip -6 route add local default dev lo table "$TABLE" 2>/dev/null
+	if [ "$IPV6" = "1" ]; then
+		ip -6 rule add fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+		ip -6 route add local default dev lo table "$TABLE" 2>/dev/null
+	else
+		# на случай переключения с on на off — снять прежние v6-правила
+		ip -6 rule del fwmark "$FWMARK" table "$TABLE" pref 100 2>/dev/null
+		ip -6 route flush table "$TABLE" 2>/dev/null
+	fi
 	return 0
 }
 
@@ -587,6 +634,10 @@ status() {
 	else
 		echo "outbound: $CT"
 	fi
+	[ "$IPV6" = "1" ] && echo "ipv6    : on (routed)" || echo "ipv6    : off (not touched)"
+	if [ "$KILL" = "1" ]; then
+		nft list chain inet "$NFT_TABLE" killswitch >/dev/null 2>&1 && echo "killsw  : on (active)" || echo "killsw  : on (NOT loaded)"
+	else echo "killsw  : off"; fi
 	xp=$(pidof xray); [ -n "$xp" ] && echo "xray    : running (pid $xp)" || echo "xray    : stopped"
 	nft list tables 2>/dev/null | grep -q "inet $NFT_TABLE" && echo "nft     : loaded" || echo "nft     : absent"
 	CNT_DOM=0; CNT_SUB=0; [ -f /tmp/fortochka.counts ] && . /tmp/fortochka.counts
@@ -664,6 +715,46 @@ upgrade() {
 	echo "updated. hit Ctrl+F5 in the panel."
 }
 
+# самодиагностика: проходим весь путь пакета и даём вердикт pass/fail.
+# бинарники -> рантайм (xray/nft/ip rule) -> чистый dns -> туннель
+doctor() {
+	load_main
+	fail=0
+	chk() { if [ "$1" = ok ]; then printf '  [ok] %s\n' "$2"; else printf '  [!!] %s\n' "$2"; fail=$((fail+1)); fi; }
+
+	echo "== fortochka doctor =="
+	echo "config : enabled=$ENABLED mode=$MODE ipv6=$IPV6 dns=$DNS_TYPE"
+
+	echo "- binaries"
+	for b in xray nft ip jq curl dnsmasq; do
+		command -v "$b" >/dev/null 2>&1 && chk ok "$b" || chk no "$b missing"
+	done
+	[ "$DNS_TYPE" != off ] && { command -v dnsproxy >/dev/null 2>&1 && chk ok dnsproxy || chk no "dnsproxy missing"; }
+
+	echo "- runtime"
+	pidof xray >/dev/null 2>&1 && chk ok "xray running" || chk no "xray not running"
+	nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && chk ok "nft table loaded" || chk no "nft table absent (kmod-nft-tproxy?)"
+	ip rule show 2>/dev/null | grep -q fwmark && chk ok "ip rule (v4)" || chk no "ip rule v4 missing"
+	if [ "$IPV6" = 1 ]; then
+		ip -6 rule show 2>/dev/null | grep -q fwmark && chk ok "ip rule (v6)" || chk no "ip rule v6 missing"
+	fi
+	if [ "$DNS_TYPE" != off ]; then
+		pidof dnsproxy >/dev/null 2>&1 && chk ok "dnsproxy running" || chk no "dnsproxy not running"
+		dns_ok && chk ok "clean DNS resolves" || chk no "clean DNS not answering (:$DNS_PORT)"
+	fi
+
+	echo "- tunnel"
+	if probe; then
+		chk ok "tunnel reachable"
+		set -- $(exit_info); echo "  exit : $1 $2"
+	else
+		chk no "tunnel probe failed (generate_204)"
+	fi
+
+	if [ "$fail" = 0 ]; then echo "== verdict: ALL GOOD =="; else echo "== verdict: $fail issue(s) =="; fi
+	[ "$fail" = 0 ]
+}
+
 # встроенный тест скорости туннеля (своя фишка)
 speedtest() {
 	pidof xray >/dev/null 2>&1 || { echo "xray not running"; return 1; }
@@ -683,6 +774,7 @@ case "$1" in
 	sub-update)          sub_update ;;
 	cron)                load_main; cron_apply; echo "cron: $INTERVAL" ;;
 	logs)                show_logs ;;
+	doctor|test)         doctor ;;
 	speedtest)           speedtest ;;
 	stats)               stats ;;
 	exit-info)           exit_info ;;
@@ -690,5 +782,5 @@ case "$1" in
 	upgrade)             upgrade ;;
 	dns-args)            dns_args ;;
 	status)              status ;;
-	*) echo "usage: fortochka {apply|down|status|update-lists|sub-update|speedtest|stats|exit-info|watchdog|upgrade|logs}" ;;
+	*) echo "usage: fortochka {apply|down|status|doctor|update-lists|sub-update|speedtest|stats|exit-info|watchdog|upgrade|logs}" ;;
 esac

@@ -155,6 +155,7 @@ return view.extend({
 						cmdBtn('🔄 ' + _('Restart'),    'cbi-button-apply',  '/etc/init.d/fortochka', [ 'restart' ], _('Restarted')),
 						cmdBtn('📥 ' + _('Lists'),       'cbi-button-action', '/usr/bin/fortochka',    [ 'update-lists' ], _('Lists updated')),
 						cmdBtn('📡 ' + _('Subscription'),'cbi-button-action', '/usr/bin/fortochka',    [ 'sub-update' ], _('Subscription updated')),
+						cmdBtn('🩺 ' + _('Doctor'),      'cbi-button-action', '/usr/bin/fortochka',    [ 'doctor' ], _('Diagnostics')),
 						cmdBtn('⚡ ' + _('Speedtest'),   'cbi-button-action', '/usr/bin/fortochka',    [ 'speedtest' ], _('Measuring')),
 						cmdBtn('⬆️ ' + _('Update'),      'cbi-button-action', '/usr/bin/fortochka',    [ 'upgrade' ], _('Updating from GitHub')),
 						cmdBtn('⏻ ' + _('Off'),          'cbi-button-reset',  '/etc/init.d/fortochka', [ 'stop' ], _('Stopped'))
@@ -203,6 +204,14 @@ return view.extend({
 
 		o = s.option(form.Flag, 'disable_quic', _('Block QUIC'),
 			_('Drop UDP/443 so browsers fall back to TCP'));
+
+		o = s.option(form.Flag, 'ipv6', _('IPv6'),
+			_('On — route IPv6 through the tunnel too. Off — do not touch IPv6 at all (no v6 TPROXY/routes). Turn off if your ISP/WAN has no IPv6 or to avoid v6 leaks.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'killswitch', _('Kill switch'),
+			_('Block traffic that should be tunneled when the tunnel is down, instead of leaking it directly. In all mode blocks every non-local forward; in domains mode blocks the listed destinations only.'));
 
 		o = s.option(form.Flag, 'exclude_ntp', _('Bypass NTP'),
 			_('Time sync (UDP/123) goes direct'));
