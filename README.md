@@ -15,8 +15,15 @@ live in the system (nft + dnsmasq + dnsproxy) — the engine is just a dumb outb
 - Clean DNS for blocked domains: dnsproxy (DoH/DoT/UDP) + bootstrap + TTL, so the
   ISP can't spoof their IPs. Built-in presets (Cloudflare/Google/Yandex/Quad9/AdGuard).
 - **Watchdog** — probes the tunnel and auto-restarts Xray if it dies.
+- **Doctor** — one-shot self-test down the whole packet path (binaries → xray/nft/
+  ip-rule → clean DNS → tunnel) with a pass/fail verdict (`fortochka doctor`).
 - **Self-update** from GitHub (`fortochka upgrade` / Update button).
 - QUIC blocking, NTP bypass, log level, list download via VPN.
+- **IPv6 toggle** — route IPv6 through the tunnel, or turn it off entirely (no v6
+  TPROXY/routes) when your WAN has no IPv6 or to avoid v6 leaks.
+- **Kill switch** — if the tunnel dies, traffic that should be tunneled is dropped
+  instead of leaking direct to the ISP (all mode blocks every non-local forward,
+  domains mode blocks the listed destinations).
 - LuCI panel: live **exit IP + country**, **↑↓ speed**, built-in **speedtest**, logs.
 
 ## Install

@@ -5,6 +5,7 @@
 			"uci": [ "fortochka" ],
 			"file": {
 				"/usr/bin/fortochka status": [ "exec" ],
+				"/usr/bin/fortochka doctor": [ "exec" ],
 				"/usr/bin/fortochka logs": [ "exec" ],
 				"/usr/bin/fortochka speedtest": [ "exec" ],
 				"/usr/bin/fortochka stats": [ "exec" ],
